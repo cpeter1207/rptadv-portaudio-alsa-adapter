@@ -28,6 +28,9 @@ The target pulls the maintained Debian 13 `:latest` base before building the
 derived image.  It then uses the normal launcher with an explicit local-image
 exception, so the launcher does not try to pull the temporary local tag.
 
+GitHub publishes the same derived quality image as one native amd64/arm64
+manifest. Pull-request jobs use that published image; they do not use QEMU.
+
 The repository owns no permanent local test container.  Use
 `tools/run-in-quality-container.sh` so stale containers bearing this workspace's
 three exact labels are cleaned before and after a run.  The launcher pulls a
