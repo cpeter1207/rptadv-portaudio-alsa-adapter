@@ -1,0 +1,16 @@
+name: Publish documentation
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  documentation:
+    uses: cpeter1207/rptadv-portaudio-alsa-adapter-workflows/.github/workflows/documentation.yml@main
+    with:
+      code_ref: ${{ github.sha }}

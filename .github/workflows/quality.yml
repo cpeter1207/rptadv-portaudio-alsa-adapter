@@ -1,0 +1,21 @@
+name: Required quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  push-preflight:
+    if: github.event_name == 'push'
+    uses: cpeter1207/rptadv-portaudio-alsa-adapter-workflows/.github/workflows/preflight.yml@main
+    with:
+      code_ref: ${{ github.sha }}
+  quality:
+    if: github.event_name != 'push'
+    uses: cpeter1207/rptadv-portaudio-alsa-adapter-workflows/.github/workflows/quality.yml@main
+    with:
+      code_ref: ${{ github.sha }}
