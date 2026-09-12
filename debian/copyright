@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: rptadv-portaudio-alsa-adapter
+Source: https://github.com/cpeter1207/rptadv-portaudio-alsa-adapter
+
+Files: *
+Copyright: 2026 Chris Peterson and rpt_advanced contributors
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify it under
+ the terms of the GNU General Public License version 2.
+ .
+ On Debian systems, the complete text is available in
+ /usr/share/common-licenses/GPL-2.

@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=${prefix}/include
+
+Name: rptadv_portaudio_alsa_adapter
+Description: PortAudio and ALSA hardware audio adapter for rpt_advanced
+Version: @VERSION@
+Libs: -L${libdir} -lrptadv_portaudio_alsa_adapter
+Cflags: -I${includedir}/rptadv_portaudio_alsa_adapter

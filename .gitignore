@@ -1,0 +1,13 @@
+/build/
+/.work/
+/target/
+*.gcda
+*.gcno
+*.gcov
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/librptadv-portaudio-alsa-adapter1/
+/debian/librptadv-portaudio-alsa-adapter-dev/
+/debian/tmp/
+/debian/*.substvars

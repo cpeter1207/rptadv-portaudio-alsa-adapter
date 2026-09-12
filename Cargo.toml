@@ -1,0 +1,19 @@
+[package]
+name = "rptadv-portaudio-alsa-adapter"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-2.0-only"
+description = "PortAudio and ALSA hardware adapter for rpt_advanced"
+repository = "https://github.com/cpeter1207/rptadv-portaudio-alsa-adapter"
+publish = false
+
+[lib]
+name = "rptadv_portaudio_alsa_adapter"
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+debug = 1
+lto = "thin"
+panic = "abort"
