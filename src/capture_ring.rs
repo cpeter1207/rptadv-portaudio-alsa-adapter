@@ -83,7 +83,11 @@ struct Functions {
 
 impl Functions {
     fn released() -> Result<Self, c_int> {
-        let descriptor = unsafe { rpcr2_descriptor().as_ref() }.ok_or(AUDIO_UNSUPPORTED)?;
+        Self::from_descriptor(unsafe { rpcr2_descriptor().as_ref() })
+    }
+
+    fn from_descriptor(descriptor: Option<&Descriptor>) -> Result<Self, c_int> {
+        let descriptor = descriptor.ok_or(AUDIO_UNSUPPORTED)?;
         if descriptor.struct_size < size_of::<Descriptor>() as u32
             || descriptor.abi_version != ABI
             || descriptor.capability_name.is_null()

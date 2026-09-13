@@ -1,6 +1,117 @@
 use super::*;
 
 #[test]
+fn descriptor_rejects_incompatible_or_incomplete_released_abi() {
+    assert!(matches!(
+        Functions::from_descriptor(None),
+        Err(AUDIO_UNSUPPORTED)
+    ));
+    for invalid in 0..9 {
+        let mut descriptor = unsafe { ptr::read(rpcr2_descriptor()) };
+        match invalid {
+            0 => descriptor.struct_size = 0,
+            1 => descriptor.abi_version = 1,
+            2 => descriptor.capability_name = ptr::null(),
+            3 => descriptor.capability_name = c"other".as_ptr(),
+            4 => descriptor.create = None,
+            5 => descriptor.destroy = None,
+            6 => descriptor.push = None,
+            7 => descriptor.render = None,
+            8 => descriptor.observe = None,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            Functions::from_descriptor(Some(&descriptor)),
+            Err(AUDIO_UNSUPPORTED)
+        ));
+    }
+}
+
+unsafe extern "C" fn create_oom(_config: *const Config, _ring: *mut *mut c_void) -> c_int {
+    -2
+}
+
+unsafe extern "C" fn create_error_with_handle(
+    config: *const Config,
+    ring: *mut *mut c_void,
+) -> c_int {
+    assert_eq!(
+        unsafe { (Functions::released().unwrap().create)(config, ring) },
+        0
+    );
+    -1
+}
+
+unsafe extern "C" fn create_null_success(_config: *const Config, _ring: *mut *mut c_void) -> c_int {
+    0
+}
+
+unsafe extern "C" fn push_error(
+    _ring: *mut c_void,
+    _input: *const f32,
+    _count: u64,
+    _accepted: *mut u64,
+) -> c_int {
+    -1
+}
+
+unsafe extern "C" fn render_error(
+    _ring: *mut c_void,
+    _output: *mut f32,
+    _count: u64,
+    _reserve: u64,
+    _target: u64,
+    _real: *mut u64,
+) -> c_int {
+    -1
+}
+
+unsafe extern "C" fn observe_error(_ring: *const c_void, _output: *mut Observation) -> c_int {
+    -1
+}
+
+#[test]
+fn allocation_failure_cleans_partial_handles_and_rejects_null_success() {
+    let mut functions = Functions::released().unwrap();
+    functions.create = create_oom;
+    assert_eq!(functions.create_ring(3840), Err(AUDIO_NO_MEMORY));
+    functions.create = create_error_with_handle;
+    assert_eq!(functions.create_ring(3840), Err(AUDIO_PORTAUDIO_ERROR));
+    functions.create = create_null_success;
+    assert_eq!(functions.create_ring(3840), Err(AUDIO_PORTAUDIO_ERROR));
+}
+
+#[test]
+fn callback_errors_silence_output_and_failed_reset_keeps_owned_audio() {
+    let mut ring = CaptureRing::new(960).unwrap();
+    unsafe { ring.push(&[0.25; 1920]) }.unwrap();
+    let functions = ring.functions;
+    ring.functions.create = create_oom;
+    assert_eq!(unsafe { ring.reset() }, Err(AUDIO_NO_MEMORY));
+    assert_eq!(ring.snapshot().unwrap().occupancy_frames, 1920);
+
+    ring.functions.push = push_error;
+    assert_eq!(unsafe { ring.push(&[0.0]) }, Err(AUDIO_PORTAUDIO_ERROR));
+    ring.functions.observe = observe_error;
+    assert!(matches!(ring.snapshot(), Err(AUDIO_PORTAUDIO_ERROR)));
+    let mut output = [1.0; 960];
+    assert_eq!(
+        unsafe { ring.pull(&mut output) },
+        Err(AUDIO_PORTAUDIO_ERROR)
+    );
+    assert!(output.iter().all(|sample| *sample == 0.0));
+
+    ring.functions = functions;
+    ring.functions.render = render_error;
+    output.fill(1.0);
+    assert_eq!(
+        unsafe { ring.pull(&mut output) },
+        Err(AUDIO_PORTAUDIO_ERROR)
+    );
+    assert!(output.iter().all(|sample| *sample == 0.0));
+}
+
+#[test]
 fn actual_ring_preserves_best_quality_startup_and_reports_overflow() {
     let ring = CaptureRing::new(960).unwrap();
     let mut output = [1.0; 960];
