@@ -1,5 +1,18 @@
 use super::*;
 
+impl CaptureRing {
+    pub(crate) fn test_with_failure(failure: &str) -> Self {
+        let mut ring = Self::new(2).unwrap();
+        match failure {
+            "create" => ring.functions.create = create_oom,
+            "push" => ring.functions.push = push_error,
+            "observe" => ring.functions.observe = observe_error,
+            _ => panic!("unsupported test failure"),
+        }
+        ring
+    }
+}
+
 #[test]
 fn descriptor_rejects_incompatible_or_incomplete_released_abi() {
     assert!(matches!(

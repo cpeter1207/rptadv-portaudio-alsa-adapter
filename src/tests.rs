@@ -13,6 +13,9 @@ use std::fs;
 use std::os::unix::{ffi::OsStringExt, fs::symlink};
 use std::path::Path;
 
+#[path = "tests/release_callbacks.rs"]
+mod release_callbacks;
+
 #[test]
 fn mono_input_is_duplicated_without_format_conversion() {
     let device = [0.25, -0.5];
@@ -126,6 +129,17 @@ impl AudioStream {
         frames: usize,
         flags: PaStreamCallbackFlags,
     ) -> c_int {
+        unsafe { self.process_callback_with_input_result(input, output, frames, flags, Ok(())) }
+    }
+
+    unsafe fn process_callback_with_input_result(
+        &mut self,
+        input: *const f32,
+        output: *mut f32,
+        frames: usize,
+        flags: PaStreamCallbackFlags,
+        input_result: Result<(), c_int>,
+    ) -> c_int {
         let capture = unsafe { &mut *self.capture.get() };
         if flags & ffi::PA_INPUT_OVERFLOW != 0 {
             self.stats
@@ -149,7 +163,7 @@ impl AudioStream {
                 }
                 device_input_to_canonical(samples, channels, canonical);
                 offset += mono.len();
-                Ok(())
+                input_result
             })
         };
         capture.publish_meter();

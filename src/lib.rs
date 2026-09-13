@@ -340,6 +340,16 @@ struct SharedStats {
 }
 
 impl SharedStats {
+    fn record_capture_overflow_timestamp(&self, now: u64) {
+        if now != 0 {
+            self.last_input_xrun_monotonic_ns
+                .store(now, Ordering::Relaxed);
+        } else {
+            self.callback_clock_error_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Measure arrival gaps against the previous block's audio duration, not a
     /// free-running ideal clock that would confuse hardware drift with lateness.
     fn callback_begin(&self, now: u64, period_ns: u64, flags: PaStreamCallbackFlags) {
@@ -579,16 +589,8 @@ impl CaptureState {
             self.stats
                 .input_overflow_count
                 .fetch_add(1, Ordering::Relaxed);
-            let now = ffi::monotonic_ns();
-            if now != 0 {
-                self.stats
-                    .last_input_xrun_monotonic_ns
-                    .store(now, Ordering::Relaxed);
-            } else {
-                self.stats
-                    .callback_clock_error_count
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            self.stats
+                .record_capture_overflow_timestamp(ffi::monotonic_ns());
         }
         let mut offset = 0;
         while offset < frame_count {
@@ -1346,7 +1348,6 @@ extern "C" fn stream_get_timing(stream: *const AudioStream, timing: *mut StreamT
         || capture_info.sample_rate <= 0.0
         || capture_info.sample_rate != info.sample_rate
         || info.output_latency < 0.0
-        || info.sample_rate <= 0.0
     {
         stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
         return AUDIO_PORTAUDIO_ERROR;
