@@ -10,10 +10,15 @@ CPPHECK ?= cppcheck
 READELF ?= readelf
 CC ?= cc
 PYTHON ?= python3
+PKG_CONFIG ?= pkg-config
+RING_PACKAGE := rate_adjusting_pcm_ring2
+RING_MIN_VERSION := 2.0.0~alpha1
+RING_LINK_FLAGS = $(shell $(PKG_CONFIG) --libs-only-L $(RING_PACKAGE))
+RING_RUSTFLAGS = $(foreach flag,$(RING_LINK_FLAGS),-C link-arg=$(flag))
 
 PACKAGE := rptadv-portaudio-alsa-adapter
 CRATE := rptadv_portaudio_alsa_adapter
-PACKAGE_VERSION ?= 0.1.0-alpha.1
+PACKAGE_VERSION ?= 0.1.0-alpha.2
 SOVERSION := 1
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -52,17 +57,20 @@ QUALITY_LAUNCHER = tools/run-in-quality-container.sh
 
 # Rust emits the ABI-major SONAME while this Makefile creates the conventional
 # versioned file and linker symlinks used by Debian and pkg-config consumers.
-SONAME_RUSTFLAGS = $(RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
+SONAME_RUSTFLAGS = $(RUSTFLAGS) $(RING_RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
 
 .PHONY: all quality lint static-analysis docs test coverage install install-check \
-	debian-package-check dist distcheck platform-verify ci quality-image container-coverage clean FORCE
+	debian-package-check dist distcheck platform-verify ci quality-image container-coverage clean check-dependencies FORCE
 
 all: $(LIBRARY_VERSIONED) $(LIBRARY_SONAME) $(LIBRARY_LINK)
 
 build:
 	mkdir -p $@
 
-$(TARGET_LIBRARY): Cargo.toml Cargo.lock $(RUST_SOURCES)
+check-dependencies:
+	$(PKG_CONFIG) --atleast-version=$(RING_MIN_VERSION) $(RING_PACKAGE)
+
+$(TARGET_LIBRARY): Cargo.toml Cargo.lock $(RUST_SOURCES) | check-dependencies
 	RUSTFLAGS="$(SONAME_RUSTFLAGS)" $(CARGO) build --release --locked
 
 $(LIBRARY_VERSIONED): $(TARGET_LIBRARY) | build
@@ -86,8 +94,8 @@ lint:
 	$(CARGO_FMT) --check
 	$(SHELLCHECK) tools/run-in-quality-container.sh
 
-static-analysis:
-	$(CARGO_CLIPPY) --all-targets --all-features -- -D warnings
+static-analysis: check-dependencies
+	RUSTFLAGS="$(RUSTFLAGS) $(RING_RUSTFLAGS)" $(CARGO_CLIPPY) --all-targets --all-features -- -D warnings
 	$(CPPHECK) --force --enable=warning,style,performance,portability \
 		--error-exitcode=1 --std=c11 -Iinclude $(C_SMOKE_SOURCE)
 
@@ -95,8 +103,8 @@ docs: | build
 	$(DOXYGEN) Doxyfile
 	test ! -s build/doxygen-warnings.log
 
-test:
-	$(CARGO) test --all-targets --locked
+test: check-dependencies
+	RUSTFLAGS="$(RUSTFLAGS) $(RING_RUSTFLAGS)" $(CARGO) test --all-targets --locked
 	$(MAKE) $(C_SMOKE_BINARY)
 	./$(C_SMOKE_BINARY)
 
@@ -110,10 +118,11 @@ $(C_SMOKE_BINARY): $(C_SMOKE_SOURCE) $(HEADER) $(LIBRARY_LINK) | build
 # audit also explicitly excludes the in-tree `src/tests.rs` test module, then
 # rejects any uncovered production lines or branches rather than relying on a
 # formatted summary intended for people.
-coverage:
+coverage: check-dependencies
 	rm -rf $(COVERAGE_DIR) $(COVERAGE_TARGET_DIR)
 	mkdir -p $(COVERAGE_DIR)
-	RUSTUP_TOOLCHAIN=$(COVERAGE_TOOLCHAIN) CARGO_LLVM_COV_TARGET_DIR=$(abspath $(COVERAGE_TARGET_DIR)) \
+	RUSTFLAGS="$(RUSTFLAGS) $(RING_RUSTFLAGS)" \
+		RUSTUP_TOOLCHAIN=$(COVERAGE_TOOLCHAIN) CARGO_LLVM_COV_TARGET_DIR=$(abspath $(COVERAGE_TARGET_DIR)) \
 		$(CARGO_LLVM_COV) --all-targets --locked --branch --json \
 		--output-path $(COVERAGE_JSON)
 	$(PYTHON) -c 'import json, os, sys; report = json.load(open(sys.argv[1], encoding="utf-8")); root = os.path.realpath(sys.argv[2]); test_module = os.path.realpath(sys.argv[3]); files = {}; [files.setdefault(path, entry["summary"]) for datum in report.get("data", []) for entry in datum.get("files", []) for path in (os.path.realpath(entry["filename"]),) if os.path.commonpath((root, path)) == root and path != test_module and "{}tests{}".format(os.path.sep, os.path.sep) not in path]; failures = [(path, metric, summary.get(metric, {})) for path, summary in sorted(files.items()) for metric in ("lines", "branches") if not isinstance(summary.get(metric), dict) or summary[metric].get("covered") != summary[metric].get("count")]; print("verified production coverage for {} source files".format(len(files))); [print("{}: {} {}/{}".format(path, metric, values.get("covered", "missing"), values.get("count", "missing")), file=sys.stderr) for path, metric, values in failures]; raise SystemExit(1 if not files or failures else 0)' $(COVERAGE_JSON) $(COVERAGE_PRODUCTION_ROOT) $(COVERAGE_TEST_MODULE)
@@ -151,6 +160,7 @@ install-check: all
 		grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'libportaudio.so'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'libasound.so'
+	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librate_adjusting_pcm_ring2.so.2'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'res_usbradio.so'
 	test -f build/stage/usr/include/rptadv_portaudio_alsa_adapter/$(notdir $(HEADER))
 	test -f build/stage/usr/lib/pkgconfig/rptadv_portaudio_alsa_adapter.pc
@@ -184,6 +194,8 @@ debian-package-check: dist
 		grep -F 'libportaudio.so'
 	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
 		grep -F 'libasound.so'
+	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
+		grep -F 'librate_adjusting_pcm_ring2.so.2'
 	! $(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
 		grep -F 'res_usbradio.so'
 

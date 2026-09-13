@@ -37,6 +37,9 @@ int main(void)
 	struct rptadv_audio_stream_stats stats = {
 		.struct_size = sizeof(stats),
 	};
+	struct rptadv_audio_stream_timing timing = {
+		.struct_size = sizeof(timing),
+	};
 	struct rptadv_audio_mixer_config mixer_config = {
 		.struct_size = sizeof(mixer_config),
 		.card = "default",
@@ -44,6 +47,38 @@ int main(void)
 		.element_index = 0,
 		.channel = 0,
 		.direction = RPTADV_AUDIO_MIXER_CAPTURE,
+	};
+	struct rptadv_audio_usb_mixer_config usb_mixer_config = {
+		.struct_size = sizeof(usb_mixer_config),
+		.usb_interface_path = "3-1:1.0",
+		.element = "Capture",
+		.element_index = 0,
+		.channel = RPTADV_AUDIO_MIXER_CHANNEL_LEFT,
+		.direction = RPTADV_AUDIO_MIXER_CAPTURE,
+	};
+	struct rptadv_audio_usb_device_identity usb_identity = {
+		.struct_size = sizeof(usb_identity),
+		.usb_interface_path = "3-1:1.0",
+		.usb_serial = "CM119-A",
+		.input_device_channels = 1,
+		.output_device_channels = 1,
+	};
+	struct rptadv_audio_usb_device_selection usb_selection = {
+		.struct_size = sizeof(usb_selection),
+	};
+	struct rptadv_audio_usb_device_selector usb_selector = {
+		.struct_size = sizeof(usb_selector),
+		.selection_policy = RPTADV_AUDIO_USB_SELECTION_EXACT,
+		.device_identifier = "hw:4,0",
+		.usb_serial = "CM119-A",
+		.input_device_channels = 1,
+		.output_device_channels = 1,
+	};
+	struct rptadv_audio_usb_device_match usb_match = {
+		.struct_size = sizeof(usb_match),
+	};
+	struct rptadv_audio_cm119_mixer_paths cm119_paths = {
+		.struct_size = sizeof(cm119_paths),
 	};
 
 	assert(descriptor != NULL);
@@ -60,8 +95,34 @@ int main(void)
 	assert(descriptor->mixer_get_centibels != NULL);
 	assert(descriptor->mixer_set_centibels != NULL);
 	assert(descriptor->mixer_destroy != NULL);
+	assert(descriptor->mixer_create_for_usb_interface != NULL);
+	assert(descriptor->mixer_get_range_steps != NULL);
+	assert(descriptor->mixer_get_steps != NULL);
+	assert(descriptor->mixer_set_steps != NULL);
+	assert(descriptor->mixer_get_normalized != NULL);
+	assert(descriptor->mixer_set_normalized != NULL);
+	assert(descriptor->mixer_get_switch != NULL);
+	assert(descriptor->mixer_set_switch != NULL);
+	assert(descriptor->usb_device_resolve != NULL);
+	assert(descriptor->usb_device_select != NULL);
+	assert(descriptor->stream_get_timing != NULL);
+	assert(descriptor->cm119_mixer_paths_resolve != NULL);
 	assert(stream_config.native_tick_context == NULL);
 	assert(mixer_config.direction == RPTADV_AUDIO_MIXER_CAPTURE);
+	assert(usb_mixer_config.direction == RPTADV_AUDIO_MIXER_CAPTURE);
+	assert(usb_identity.input_device_channels == 1);
+	assert(usb_selection.abi_version == 0);
+	assert(usb_selector.selection_policy == RPTADV_AUDIO_USB_SELECTION_EXACT);
+	assert(usb_match.abi_version == 0);
+	assert(cm119_paths.abi_version == 0);
+	assert(cm119_paths.rx_capture_path_count == 0);
+	assert(cm119_paths.tx_playback_path_count == 0);
+	assert(cm119_paths.sidetone_path_count == 0);
+	assert(cm119_paths.rx_compatibility_switch_path_count == 0);
+	assert(RPTADV_AUDIO_CM119_MIXER_PATH_CAPACITY == 2U);
+	assert(RPTADV_AUDIO_CM119_MIXER_ELEMENT_NAME_CAPACITY >= 19U);
+	assert(RPTADV_AUDIO_MIXER_NORMALIZED_MINIMUM == 0U);
+	assert(RPTADV_AUDIO_MIXER_NORMALIZED_MAXIMUM == 999U);
 	assert(stats.abi_version == 0);
 	assert(stats.callback_count == 0);
 	assert(stats.callback_frame_count == 0);
@@ -76,5 +137,9 @@ int main(void)
 	assert(stats.output_peak == 0.0F);
 	assert(stats.output_rms == 0.0F);
 	assert(stats.last_portaudio_error == 0);
+	assert(timing.abi_version == 0);
+	assert(timing.input_latency_seconds == 0.0);
+	assert(timing.output_latency_seconds == 0.0);
+	assert(timing.sample_rate_hz == 0.0);
 	return 0;
 }

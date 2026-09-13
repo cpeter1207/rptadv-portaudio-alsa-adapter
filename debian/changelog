@@ -1,3 +1,12 @@
+rptadv-portaudio-alsa-adapter (0.1.0~alpha2-1) unstable; urgency=medium
+
+  * Publish the tested independent capture/playback callback milestone.
+  * Dynamically link the released F32 rate-adjusting PCM ring.
+  * Preserve ABI 1 while extending USB selection, CM119 mixer control,
+    stream timing, and bounded capture diagnostics.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Sun, 13 Sep 2026 16:00:00 -0500
+
 rptadv-portaudio-alsa-adapter (0.1.0~alpha1-1) unstable; urgency=medium
 
   * Establish source-package scaffolding for the first ABI-major release.

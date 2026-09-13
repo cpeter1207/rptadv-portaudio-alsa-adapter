@@ -5,7 +5,9 @@ on:
     tags: ['v*']
 
 permissions:
+  checks: read
   contents: write
+  pull-requests: read
 
 jobs:
   release:
