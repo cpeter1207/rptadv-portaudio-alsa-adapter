@@ -14,8 +14,8 @@ checks in parallel.  Production Rust code requires 100% line and branch
 coverage on Debian 13 amd64 only.  The amd64 coverage job uses the pinned
 nightly toolchain in `containers/quality.Dockerfile`, because Rust branch
 coverage instrumentation is not yet stable.  It writes an ignored JSON report
-under `build/coverage/`, excludes `tests/` and the in-tree `src/tests.rs` test
-module, and fails if any remaining production `src/` line or branch is
+under `build/coverage/`, excludes test modules in `tests/`, `src/tests/`, and
+`src/tests.rs`, and fails if any remaining production `src/` line or branch is
 uncovered.
 
 Build and run that exact local quality image with:
