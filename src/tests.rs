@@ -13,6 +13,8 @@ use std::fs;
 use std::os::unix::{ffi::OsStringExt, fs::symlink};
 use std::path::Path;
 
+#[path = "tests/cm119_release.rs"]
+mod cm119_release;
 #[path = "tests/release_callbacks.rs"]
 mod release_callbacks;
 

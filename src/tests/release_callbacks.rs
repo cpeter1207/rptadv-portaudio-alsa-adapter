@@ -13,6 +13,7 @@ fn capture_handles_missing_input_and_reports_failed_push_and_clock_reads() {
         &ffi::PRODUCTION_FUNCTIONS,
         test_config(2, 1, 1, copy_input_to_output),
     );
+    assert_eq!(stream.stop_endpoints(), AUDIO_OK);
     assert_eq!(
         unsafe {
             capture_callback(
@@ -160,7 +161,7 @@ fn start_handles_capture_activity_stop_failure_and_ring_failures() {
     assert_eq!(stream_start(stream), AUDIO_OK);
     FAKE_PORTAUDIO.with(|state| {
         let mut state = state.borrow_mut();
-        state.endpoint_active[1] = 0;
+        state.endpoint_active[0] = 0;
         state.stop_result = -18;
     });
     assert_eq!(stream_start(stream), AUDIO_PORTAUDIO_ERROR);
@@ -207,7 +208,13 @@ fn second_endpoint_failed_close_retains_live_capture_storage() {
         unsafe { capture_callback(ptr::null(), ptr::null_mut(), 2, ptr::null(), 0, capture) },
         ffi::PA_CONTINUE
     );
-    assert_eq!(portaudio_runtime().lock().unwrap().references, 1);
+    assert_eq!(
+        portaudio_runtime()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .references,
+        1
+    );
     let mut registry = device_lease_registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -221,6 +228,41 @@ fn second_endpoint_failed_close_retains_live_capture_storage() {
 
 thread_local! {
     static CAPTURE_TIMING: RefCell<Option<ffi::PaStreamInfo>> = RefCell::new(Some(fake_stream_info()));
+}
+
+unsafe extern "C" fn start_failure_after_activation(stream: *mut PaStream) -> PaError {
+    assert_eq!(unsafe { fake_pa_start_stream(stream) }, ffi::PA_NO_ERROR);
+    -31
+}
+
+static LATE_START_FAILURE_FUNCTIONS: ffi::FunctionTable = ffi::FunctionTable {
+    portaudio: ffi::PortAudioFunctions {
+        start_stream: start_failure_after_activation,
+        ..TEST_FUNCTIONS.portaudio
+    },
+    ..TEST_FUNCTIONS
+};
+
+#[test]
+fn failed_start_aborts_an_endpoint_that_became_active_before_returning_error() {
+    let _serial = lock_fake();
+    reset_fake_functions();
+    let mut stream = ptr::null_mut();
+    assert_eq!(
+        stream_create_with_functions(
+            &LATE_START_FAILURE_FUNCTIONS,
+            &ffi_stream_config(),
+            &mut stream,
+        ),
+        AUDIO_OK
+    );
+    assert_eq!(stream_start(stream), AUDIO_PORTAUDIO_ERROR);
+    FAKE_PORTAUDIO.with(|state| {
+        let state = state.borrow();
+        assert_eq!(state.abort_count, 1);
+        assert!(state.endpoint_active.iter().all(|active| *active == 0));
+    });
+    stream_destroy(stream);
 }
 
 unsafe extern "C" fn separate_stream_info(stream: *mut PaStream) -> *const ffi::PaStreamInfo {

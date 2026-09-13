@@ -2525,7 +2525,7 @@ fn append_cm119_mixer_path(
     if !source.volume_supported && !source.switch_supported {
         return Ok(());
     }
-    let index = usize::try_from(*count).map_err(|_| AUDIO_UNSUPPORTED)?;
+    let index = *count as usize;
     let path = paths.get_mut(index).ok_or(AUDIO_UNSUPPORTED)?;
     let bytes = source.name.to_bytes();
     if bytes.len() >= path.element.len() {
