@@ -1,7 +1,7 @@
 # rptadv-portaudio-alsa-adapter
 
 `rptadv-portaudio-alsa-adapter` is the hardware-audio boundary for the
-standalone `rpt_advanced` architecture.  It will provide a small versioned
+standalone `rpt_advanced` architecture. It provides a small versioned
 shared object that owns PortAudio stream lifetime, ALSA mixer control, and raw
 hardware-audio measurements for one radio port.
 
@@ -14,7 +14,7 @@ their respective adapters and in `librptadvradio`.
 All internal audio interfaces use interleaved normalized `f32` PCM with a
 full-scale reference from `-1.0` through `+1.0`.  The adapter requests
 `paFloat32` from PortAudio, so a PortAudio callback has the same representation
-as the internal native-tick boundary.  PortAudio or its host API may still
+as the internal worker boundary. PortAudio or its host API may still
 perform device-format conversion when the hardware itself does not natively
 accept 32-bit float; no application-side PCM conversion is needed at that
 boundary. Channel normalization remains adapter work: mono input is duplicated
@@ -28,17 +28,17 @@ S16 Asterisk and CM119 boundaries.
 
 ## Status
 
-Version `0.1.0-alpha.2` packages the tested independent capture/playback
-milestone as a Rust `cdylib` with ABI major 1. Release publication requires
+Version `0.2.0-alpha.1` packages separate input-paced receive and DAC-paced
+transmit workers as a Rust `cdylib` with ABI major 2. Release publication requires
 the full pull-request quality gate, including native Debian 13 amd64 and arm64
 package checks and 100% production line and branch coverage on amd64.
 
 ## Published artifacts
 
-The ABI-major-1 release publishes dynamically linked artifacts:
+The ABI-major-2 release publishes dynamically linked artifacts:
 
-- `librptadv_portaudio_alsa_adapter.so.1`
-- `librptadv-portaudio-alsa-adapter1`
+- `librptadv_portaudio_alsa_adapter.so.2`
+- `librptadv-portaudio-alsa-adapter2`
 - `librptadv-portaudio-alsa-adapter-dev`
 - `rptadv_portaudio_alsa_adapter.pc`
 
@@ -47,7 +47,7 @@ linker symlink, and pkg-config metadata. It ships no static archive.
 
 ## ABI and device ownership
 
-ABI major 1 is provided by `librptadv_portaudio_alsa_adapter.so.1`. Consumers
+ABI major 2 is provided by `librptadv_portaudio_alsa_adapter.so.2`. Consumers
 must require a compatible major version through the Debian runtime package or
 the pkg-config metadata. An adapter change takes effect only through a
 controlled stream and process restart; it is never hot-replaced while audio is
@@ -65,13 +65,12 @@ The adapter then takes a process-wide control-plane lease on each resolved
 PortAudio device index. A second stream that overlaps either physical device
 fails with `RPTADV_AUDIO_DEVICE_BUSY`; the lease is released after stream close
 or an open failure. The lease mutex is never touched by the audio callback.
-The adapter selects each device's default-low PortAudio latency. Independent
-capture and playback clocks are bridged by the released F32 rate-adjusting PCM
-ring, dynamically linked as `librate_adjusting_pcm_ring2.so.2` (version
-`2.0.0~alpha1` or newer). Building requires `librate-adjusting-pcm-ring2-dev`;
-the runtime dependency is `librate-adjusting-pcm-ring2`. No ring implementation
-or static archive is bundled in this adapter.
-The callback must run at the highest `SCHED_FIFO` priority (99 on Linux).
+The adapter selects each device's default-low PortAudio latency. Capture and
+playback run independently: capture dispatches each input block directly to the
+receive worker, and playback asks the transmit worker to fill each output block.
+The owning radio core is responsible for any path that bridges the two device
+clocks. The adapter contains no PCM ring or resampler.
+Both callbacks must run at the highest `SCHED_FIFO` priority (99 on Linux).
 Stream startup temporarily applies that policy to the calling thread so the
 PortAudio ALSA callback inherits it, then restores the caller's original policy
 and priority. PortAudio 19.6's ALSA realtime helper is not used because it selects
@@ -80,7 +79,7 @@ FIFO priority 1. The service needs permission for priority 99, for example
 Scheduling setup failure prevents stream start. Restoration failure aborts a
 successfully started stream and reports an error; scheduling failures appear as
 PortAudio internal errors in the existing statistics. No scheduling calls run
-inside the audio callback, and the public ABI is unchanged.
+inside an audio callback.
 After opening, `stream_get_timing` reports PortAudio's actual input/output
 latency estimates and actual sample-rate estimate without exposing a PortAudio
 type. It accepts PortAudio 19.6 ALSA's zero stream-info version while validating
@@ -111,8 +110,7 @@ Each mixer handle also owns one explicit capture or playback path switch. Open
 the desired ALSA element and channel, then set its switch; the adapter does not
 guess a device-specific CM119 routing plan. This keeps a complete path plan
 visible in configuration and works for mixer elements that have only a switch
-or only a volume control. These trailing ABI-1 descriptor entries preserve the
-layout and behavior seen by existing ABI-1 consumers.
+or only a volume control. These functions remain part of the ABI-2 descriptor.
 
 For a CM119 compatibility adapter, `cm119_mixer_paths_resolve` supplies that
 plan without hard-coding whether a particular interface calls its output
@@ -143,47 +141,33 @@ identity change requires the controlled stream handoff defined by the ADRs.
 
 ## Development environment
 
-### Independent capture-clock trial
+### Split callback model
 
-This alpha milestone accepts mono physical capture only; stereo capture
-is rejected, not flattened into unrelated mono samples. Separate PortAudio
-callbacks service capture and playback. Capture pushes into the released F32
-ring; playback renders clock-corrected mono, duplicates it to the canonical
-stereo input, and drives the native processing tick. Callback duration and
-late-start diagnostics therefore describe the playback callback. Both callback
-threads retain the highest-priority scheduling contract above.
+Separate PortAudio streams service capture and playback at a fixed 48 kHz.
+The capture callback normalizes mono or stereo physical input to canonical
+interleaved stereo and invokes the receive worker. The playback callback invokes
+the transmit worker, then maps canonical stereo to the physical output. A host
+block larger than the corresponding predeclared maximum is split into bounded
+worker calls. All workspaces are allocated before either stream starts.
 
-The statistics expose capture callback count, ring target and applied ratio
-correction, concealed frames, dropped input frames, and initial startup-wait
-frames. Existing input-queue fields report ring capacity and occupancy; there
-is no separate playback PCM queue. Startup wait is reported separately from
-runtime shortfall. With the node's 960-frame maximum callback, the target is
-1536 frames (32 ms at 48 kHz), initial priming is 1920 frames, and storage
-capacity is 3840 frames. Other callback limits use a target of the maximum
-block plus the larger of 96 frames or three fifths of that block.
+The callback paths do not allocate, lock, block, log, or perform control-plane
+I/O. Each worker must consume or produce the complete `frame_count` it receives.
+The two callbacks are independent; neither waits for or transfers PCM to the
+other inside this adapter. They may run concurrently, so the owning core must
+use disjoint callback contexts or make shared state safe without blocking.
 
-This target is specific to the observed positive capture-clock drift on the
-trial node. Negative-drift probes exposed shortfalls; the trial does not claim
-general bidirectional clock-drift tolerance.
-
-The statistics getter retains both the original ABI-1 prefix and the earlier
-timing-extended prefix, writing only the caller-supported structure size. The
-six capture fields extend the tail without changing the descriptor or SONAME.
-
-Callback diagnostics report last/maximum execution duration and positive excess
-between successive callback starts over the previous block's audio duration.
+Callback duration, frame-count, and late-start diagnostics describe playback.
+They report last/maximum execution duration and positive excess between
+successive playback-callback starts over the previous block's audio duration.
 The late-start counter counts excess greater than 1 ms; the first callback after
 each start is excluded. These gaps include PortAudio/ALSA wakeup and dispatch
 variation, not just operating-system scheduler delay. Duration includes any
 preemption during the callback. Input/output xrun notification timestamps use
 `CLOCK_MONOTONIC` nanoseconds since boot, with zero meaning none observed; they
 date the notification, not the exact sample where hardware lost continuity.
-Reads and atomic publication do no allocation or logging in the callback.
-
-The statistics extension preserves ABI 1: the existing getter accepts the
-original snapshot size and never writes past it. New consumers zero-initialize
-the extended structure; a zero late-start tolerance identifies an older library
-without timing diagnostics. No descriptor-layout or SONAME change is required.
+Capture and playback callback counts, worker failures, physical input/output
+meters, and xrun notifications are reported independently where applicable.
+Reads and atomic publication do no allocation or logging in either callback.
 
 The repository uses the project-owned, labeled container launcher.  It removes
 only stale containers from this exact workspace and records the freshly pulled

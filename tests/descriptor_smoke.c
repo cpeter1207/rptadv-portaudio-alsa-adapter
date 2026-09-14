@@ -8,11 +8,18 @@
 
 #include "rptadv_portaudio_alsa_adapter/rptadv_portaudio_alsa_adapter.h"
 
-static int32_t noop_tick(void *context, const float *input, float *output,
-			 uint32_t frame_count)
+static int32_t noop_receive(void *context, const float *input,
+			    uint32_t frame_count)
 {
 	(void)context;
 	(void)input;
+	(void)frame_count;
+	return 0;
+}
+
+static int32_t noop_transmit(void *context, float *output, uint32_t frame_count)
+{
+	(void)context;
 	(void)output;
 	(void)frame_count;
 	return 0;
@@ -25,14 +32,17 @@ int main(void)
 	struct rptadv_audio_stream_config stream_config = {
 		.struct_size = sizeof(stream_config),
 		.abi_version = RPTADV_AUDIO_ADAPTER_ABI_VERSION,
-		.native_sample_rate_hz = 48000,
-		.maximum_frame_count = 960,
+		.native_sample_rate_hz = RPTADV_AUDIO_NATIVE_SAMPLE_RATE_HZ,
+		.maximum_receive_frame_count = 960,
+		.maximum_transmit_frame_count = 960,
 		.input_device_index = RPTADV_AUDIO_DEFAULT_DEVICE,
 		.output_device_index = RPTADV_AUDIO_DEFAULT_DEVICE,
 		.input_device_channels = 1,
 		.output_device_channels = 1,
-		.native_tick = noop_tick,
-		.native_tick_context = NULL,
+		.receive_worker = noop_receive,
+		.receive_worker_context = NULL,
+		.transmit_worker = noop_transmit,
+		.transmit_worker_context = NULL,
 	};
 	struct rptadv_audio_stream_stats stats = {
 		.struct_size = sizeof(stats),
@@ -107,7 +117,8 @@ int main(void)
 	assert(descriptor->usb_device_select != NULL);
 	assert(descriptor->stream_get_timing != NULL);
 	assert(descriptor->cm119_mixer_paths_resolve != NULL);
-	assert(stream_config.native_tick_context == NULL);
+	assert(stream_config.receive_worker_context == NULL);
+	assert(stream_config.transmit_worker_context == NULL);
 	assert(mixer_config.direction == RPTADV_AUDIO_MIXER_CAPTURE);
 	assert(usb_mixer_config.direction == RPTADV_AUDIO_MIXER_CAPTURE);
 	assert(usb_identity.input_device_channels == 1);
@@ -127,7 +138,7 @@ int main(void)
 	assert(stats.callback_count == 0);
 	assert(stats.callback_frame_count == 0);
 	assert(stats.oversized_callback_count == 0);
-	assert(stats.native_tick_failure_count == 0);
+	assert(stats.worker_failure_count == 0);
 	assert(stats.input_overflow_count == 0);
 	assert(stats.output_underflow_count == 0);
 	assert(stats.input_clip_sample_count == 0);

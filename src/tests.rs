@@ -78,31 +78,54 @@ fn meter_tracks_peak_rms_and_clipping() {
     assert!((meter.rms() - 0.838_525_5).abs() < 0.000_001);
 }
 
-unsafe extern "C" fn copy_input_to_output(
+unsafe extern "C" fn accept_input(
     _context: *mut c_void,
-    input: *const f32,
+    _input: *const f32,
+    _frame_count: u32,
+) -> i32 {
+    0
+}
+
+unsafe extern "C" fn silence_output(
+    _context: *mut c_void,
     output: *mut f32,
     frame_count: u32,
 ) -> i32 {
     let sample_count = frame_count as usize * pcm::CANONICAL_CHANNELS;
-    unsafe {
-        ptr::copy_nonoverlapping(input, output, sample_count);
+    unsafe { std::slice::from_raw_parts_mut(output, sample_count) }.fill(0.0);
+    0
+}
+
+unsafe extern "C" fn stereo_pattern_output(
+    _context: *mut c_void,
+    output: *mut f32,
+    frame_count: u32,
+) -> i32 {
+    for (frame, samples) in unsafe {
+        std::slice::from_raw_parts_mut(output, frame_count as usize * pcm::CANONICAL_CHANNELS)
+    }
+    .chunks_exact_mut(pcm::CANONICAL_CHANNELS)
+    .enumerate()
+    {
+        samples.copy_from_slice(if frame % 2 == 0 {
+            &[0.125, -0.25]
+        } else {
+            &[0.5, -0.75]
+        });
     }
     0
 }
 
-unsafe extern "C" fn fail_tick(
+unsafe extern "C" fn fail_transmit(
     _context: *mut c_void,
-    _input: *const f32,
     _output: *mut f32,
     _frame_count: u32,
 ) -> i32 {
     1
 }
 
-unsafe extern "C" fn fail_on_second_tick(
+unsafe extern "C" fn fail_on_second_transmit(
     context: *mut c_void,
-    input: *const f32,
     output: *mut f32,
     frame_count: u32,
 ) -> i32 {
@@ -111,19 +134,18 @@ unsafe extern "C" fn fail_on_second_tick(
     if *invocation == 2 {
         return 1;
     }
-    unsafe { copy_input_to_output(ptr::null_mut(), input, output, frame_count) }
+    unsafe { silence_output(ptr::null_mut(), output, frame_count) }
 }
 
 fn prepared_test_stream(
     functions: &'static ffi::FunctionTable,
     config: ValidatedStreamConfig,
 ) -> AudioStream {
-    AudioStream::new(functions, config).expect("prepare shared capture ring")
+    AudioStream::new(functions, config)
 }
 
 impl AudioStream {
-    /// Exercise the actual bounded render/mapping path with an exact input
-    /// provider, independently of the separately tested asynchronous SRC.
+    /// Exercise the two independent callback paths in capture/playback order.
     unsafe fn process_callback(
         &mut self,
         input: *const f32,
@@ -131,45 +153,19 @@ impl AudioStream {
         frames: usize,
         flags: PaStreamCallbackFlags,
     ) -> c_int {
-        unsafe { self.process_callback_with_input_result(input, output, frames, flags, Ok(())) }
-    }
-
-    unsafe fn process_callback_with_input_result(
-        &mut self,
-        input: *const f32,
-        output: *mut f32,
-        frames: usize,
-        flags: PaStreamCallbackFlags,
-        input_result: Result<(), c_int>,
-    ) -> c_int {
-        let capture = unsafe { &mut *self.capture.get() };
-        if flags & ffi::PA_INPUT_OVERFLOW != 0 {
-            self.stats
-                .input_overflow_count
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let channels = self.config.input_channels;
-        let mut offset = 0;
-        let result = unsafe {
-            (*self.playback.get()).render_callback(output, frames, flags, |mono, canonical| {
-                let samples = if input.is_null() {
-                    None
-                } else {
-                    Some(std::slice::from_raw_parts(
-                        input.add(offset * channels),
-                        mono.len() * channels,
-                    ))
-                };
-                if let Some(samples) = samples {
-                    capture.input_meter.observe(samples);
-                }
-                device_input_to_canonical(samples, channels, canonical);
-                offset += mono.len();
-                input_result
-            })
+        let capture_result = unsafe {
+            (*self.capture.get()).process_callback(input, frames, flags & ffi::PA_INPUT_OVERFLOW)
         };
-        capture.publish_meter();
-        result
+        if capture_result != ffi::PA_CONTINUE {
+            return capture_result;
+        }
+        unsafe {
+            (*self.playback.get()).process_callback(
+                output,
+                frames,
+                flags & ffi::PA_OUTPUT_UNDERFLOW,
+            )
+        }
     }
 }
 
@@ -177,17 +173,20 @@ fn test_config(
     maximum_frame_count: usize,
     input_channels: usize,
     output_channels: usize,
-    native_tick: unsafe extern "C" fn(*mut c_void, *const f32, *mut f32, u32) -> i32,
+    transmit_worker: unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32,
 ) -> ValidatedStreamConfig {
     ValidatedStreamConfig {
         sample_rate_hz: 48_000,
-        maximum_frame_count,
+        maximum_receive_frame_count: maximum_frame_count,
+        maximum_transmit_frame_count: maximum_frame_count,
         input_device_index: DEFAULT_DEVICE,
         output_device_index: DEFAULT_DEVICE,
         input_channels,
         output_channels,
-        native_tick,
-        native_tick_context: ptr::null_mut(),
+        receive_worker: accept_input,
+        receive_worker_context: ptr::null_mut(),
+        transmit_worker,
+        transmit_worker_context: ptr::null_mut(),
     }
 }
 
@@ -1388,13 +1387,16 @@ fn ffi_stream_config() -> StreamConfig {
         struct_size: size_of::<StreamConfig>() as u32,
         abi_version: ABI_VERSION,
         native_sample_rate_hz: 48_000,
-        maximum_frame_count: 2,
+        maximum_receive_frame_count: 2,
+        maximum_transmit_frame_count: 2,
         input_device_index: DEFAULT_DEVICE,
         output_device_index: DEFAULT_DEVICE,
         input_device_channels: 1,
         output_device_channels: 1,
-        native_tick: Some(copy_input_to_output),
-        native_tick_context: ptr::null_mut(),
+        receive_worker: Some(accept_input),
+        receive_worker_context: ptr::null_mut(),
+        transmit_worker: Some(silence_output),
+        transmit_worker_context: ptr::null_mut(),
     }
 }
 
@@ -1550,20 +1552,15 @@ fn fake_mixer(config: &MixerConfig) -> *mut AudioMixer {
 }
 
 #[test]
-fn validate_stream_config_rejects_missing_tick() {
-    let config = StreamConfig {
-        struct_size: size_of::<StreamConfig>() as u32,
-        abi_version: ABI_VERSION,
-        native_sample_rate_hz: 48_000,
-        maximum_frame_count: 960,
-        input_device_index: DEFAULT_DEVICE,
-        output_device_index: DEFAULT_DEVICE,
-        input_device_channels: 1,
-        output_device_channels: 1,
-        native_tick: None,
-        native_tick_context: ptr::null_mut(),
-    };
-
+fn validate_stream_config_requires_both_workers() {
+    let mut config = ffi_stream_config();
+    config.receive_worker = None;
+    assert!(matches!(
+        unsafe { ValidatedStreamConfig::from_ffi(&config) },
+        Err(AUDIO_INVALID_ARGUMENT)
+    ));
+    config = ffi_stream_config();
+    config.transmit_worker = None;
     assert!(matches!(
         unsafe { ValidatedStreamConfig::from_ffi(&config) },
         Err(AUDIO_INVALID_ARGUMENT)
@@ -1589,7 +1586,9 @@ fn validate_stream_config_rejects_every_incompatible_abi_field() {
     reject(|value| value.struct_size = 0);
     reject(|value| value.abi_version = ABI_VERSION + 1);
     reject(|value| value.native_sample_rate_hz = 0);
-    reject(|value| value.maximum_frame_count = 0);
+    reject(|value| value.native_sample_rate_hz = 96_000);
+    reject(|value| value.maximum_receive_frame_count = 0);
+    reject(|value| value.maximum_transmit_frame_count = 0);
     reject(|value| value.input_device_channels = 0);
     reject(|value| value.input_device_channels = 3);
     reject(|value| value.output_device_channels = 0);
@@ -1601,16 +1600,17 @@ fn validate_stream_config_rejects_every_incompatible_abi_field() {
 #[test]
 fn validate_stream_config_preserves_valid_configuration() {
     let mut config = ffi_stream_config();
-    config.native_sample_rate_hz = 96_000;
-    config.maximum_frame_count = 1_024;
+    config.maximum_receive_frame_count = 1_024;
+    config.maximum_transmit_frame_count = 512;
     config.input_device_index = 3;
     config.output_device_index = 4;
     config.input_device_channels = 2;
     config.output_device_channels = 2;
     let validated = unsafe { ValidatedStreamConfig::from_ffi(&config) }.unwrap();
 
-    assert_eq!(validated.sample_rate_hz, 96_000);
-    assert_eq!(validated.maximum_frame_count, 1_024);
+    assert_eq!(validated.sample_rate_hz, 48_000);
+    assert_eq!(validated.maximum_receive_frame_count, 1_024);
+    assert_eq!(validated.maximum_transmit_frame_count, 512);
     assert_eq!(validated.input_device_index, 3);
     assert_eq!(validated.output_device_index, 4);
     assert_eq!(validated.input_channels, 2);
@@ -1673,7 +1673,6 @@ fn function_table_exercises_f32_stream_lifecycle_without_hardware() {
     let input = [0.123_456_7, -0.625];
     let mut output = [0.0; 2];
     assert_eq!(fake_invoke_callback(&input, &mut output), ffi::PA_CONTINUE);
-    // Playback starts on time; initial capture priming is explicit silence.
     assert_eq!(output, [0.0; 2]);
     let mut stats = StreamStats {
         struct_size: size_of::<StreamStats>() as u32,
@@ -1681,8 +1680,7 @@ fn function_table_exercises_f32_stream_lifecycle_without_hardware() {
     };
     assert_eq!(stream_get_stats(stream, &mut stats), AUDIO_OK);
     assert_eq!(stats.capture_callback_count, 1);
-    assert_eq!(stats.capture_startup_wait_frames, 2);
-    assert_eq!(stats.capture_ring_missing_frames, 0);
+    assert_eq!(stats.callback_count, 1);
     assert_eq!(stream_stop(stream), AUDIO_OK);
     stream_destroy(stream);
 
@@ -2911,10 +2909,10 @@ fn resolve_device_rejects_unavailable_or_unsupported_devices() {
 }
 
 #[test]
-fn callback_preserves_f32_samples_and_splits_oversized_blocks() {
+fn callbacks_preserve_f32_samples_and_split_oversized_blocks() {
     let mut stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
-        test_config(2, 1, 1, copy_input_to_output),
+        test_config(2, 1, 1, stereo_pattern_output),
     );
     let input = [0.123_456_7, -0.75, 1.0];
     let mut output = [0.0; 3];
@@ -2929,13 +2927,13 @@ fn callback_preserves_f32_samples_and_splits_oversized_blocks() {
     };
 
     assert_eq!(result, ffi::PA_CONTINUE);
-    assert_eq!(output, input);
+    assert_eq!(output, [-0.0625, -0.125, -0.0625]);
     assert_eq!(
         stream
             .stats
             .oversized_callback_count
             .load(Ordering::Acquire),
-        1
+        2
     );
     assert_eq!(stream.stats.callback_count.load(Ordering::Acquire), 1);
     assert_eq!(stream.stats.callback_frame_count.load(Ordering::Acquire), 3);
@@ -2953,14 +2951,16 @@ fn callback_preserves_f32_samples_and_splits_oversized_blocks() {
             .stats
             .output_clip_sample_count
             .load(Ordering::Acquire),
-        1
+        0
     );
 }
 
 #[test]
 fn callback_failure_silences_the_current_device_block() {
-    let mut stream =
-        prepared_test_stream(&ffi::PRODUCTION_FUNCTIONS, test_config(2, 2, 2, fail_tick));
+    let mut stream = prepared_test_stream(
+        &ffi::PRODUCTION_FUNCTIONS,
+        test_config(2, 2, 2, fail_transmit),
+    );
     let input = [0.25, -0.25, 0.5, -0.5];
     let mut output = [1.0; 4];
 
@@ -2968,13 +2968,7 @@ fn callback_failure_silences_the_current_device_block() {
 
     assert_eq!(result, ffi::PA_ABORT);
     assert_eq!(output, [0.0; 4]);
-    assert_eq!(
-        stream
-            .stats
-            .native_tick_failure_count
-            .load(Ordering::Acquire),
-        1
-    );
+    assert_eq!(stream.stats.worker_failure_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -2983,8 +2977,8 @@ fn callback_failure_silences_unprocessed_oversized_output() {
     let mut stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
         ValidatedStreamConfig {
-            native_tick_context: (&mut invocation as *mut usize).cast::<c_void>(),
-            ..test_config(2, 1, 1, fail_on_second_tick)
+            transmit_worker_context: (&mut invocation as *mut usize).cast::<c_void>(),
+            ..test_config(2, 1, 1, fail_on_second_transmit)
         },
     );
     let input = [0.25, -0.5, 0.75];
@@ -2993,7 +2987,7 @@ fn callback_failure_silences_unprocessed_oversized_output() {
     let result = unsafe { stream.process_callback(input.as_ptr(), output.as_mut_ptr(), 3, 0) };
 
     assert_eq!(result, ffi::PA_ABORT);
-    assert_eq!(output, [0.25, -0.5, 0.0]);
+    assert_eq!(output, [0.0; 3]);
     assert_eq!(invocation, 2);
 }
 
@@ -3129,84 +3123,19 @@ fn monotonic_clock_conversion_and_failures_are_deterministic() {
 }
 
 #[test]
-fn stream_stats_preserve_original_and_future_caller_allocation_bounds() {
-    #[repr(C, align(8))]
-    struct LegacyStorage {
-        prefix: [u8; STREAM_STATS_V1_SIZE],
-        canary: [u8; 32],
-    }
+fn stream_stats_preserve_future_caller_allocation_bounds() {
     #[repr(C)]
     struct FutureStorage {
         current: StreamStats,
         canary: [u8; 32],
     }
-    #[repr(C, align(8))]
-    struct TimingStorage {
-        prefix: [u8; STREAM_STATS_TIMING_SIZE],
-        canary: [u8; 32],
-    }
-    assert_eq!(STREAM_STATS_V1_SIZE, 144);
-    assert_eq!(STREAM_STATS_TIMING_SIZE, 216);
-    assert_eq!(size_of::<StreamStats>(), 264);
     let stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
-        test_config(2, 2, 2, copy_input_to_output),
+        test_config(2, 2, 2, stereo_pattern_output),
     );
     stream.stats.callback_count.store(17, Ordering::Relaxed);
     stream.stats.record_portaudio_error(-321);
     stream.stats.callback_end(1, 987_655);
-    let mut timing = TimingStorage {
-        prefix: [0; STREAM_STATS_TIMING_SIZE],
-        canary: [0x6c; 32],
-    };
-    timing.prefix[..4].copy_from_slice(&(STREAM_STATS_TIMING_SIZE as u32).to_ne_bytes());
-    assert_eq!(
-        stream_get_stats(&stream, timing.prefix.as_mut_ptr().cast()),
-        AUDIO_OK
-    );
-    assert_eq!(timing.canary, [0x6c; 32]);
-    let duration_offset = offset_of!(StreamStats, callback_last_duration_ns);
-    assert_eq!(
-        u64::from_ne_bytes(
-            timing.prefix[duration_offset..duration_offset + 8]
-                .try_into()
-                .unwrap()
-        ),
-        987_654
-    );
-    let mut legacy = LegacyStorage {
-        prefix: [0; STREAM_STATS_V1_SIZE],
-        canary: [0xa5; 32],
-    };
-    legacy.prefix[..4].copy_from_slice(&(STREAM_STATS_V1_SIZE as u32).to_ne_bytes());
-    assert_eq!(
-        stream_get_stats(&stream, legacy.prefix.as_mut_ptr().cast()),
-        AUDIO_OK
-    );
-    assert_eq!(legacy.canary, [0xa5; 32]);
-    assert_eq!(
-        u32::from_ne_bytes(legacy.prefix[..4].try_into().unwrap()),
-        STREAM_STATS_V1_SIZE as u32
-    );
-    let callback_offset = std::mem::offset_of!(StreamStats, callback_count);
-    assert_eq!(
-        u64::from_ne_bytes(
-            legacy.prefix[callback_offset..callback_offset + 8]
-                .try_into()
-                .unwrap()
-        ),
-        17
-    );
-    let error_offset = std::mem::offset_of!(StreamStats, last_portaudio_error);
-    assert_eq!(
-        i32::from_ne_bytes(
-            legacy.prefix[error_offset..error_offset + 4]
-                .try_into()
-                .unwrap()
-        ),
-        -321
-    );
-
     let mut future = FutureStorage {
         current: StreamStats {
             struct_size: size_of::<FutureStorage>() as u32,
@@ -3226,14 +3155,13 @@ fn stream_stats_preserve_original_and_future_caller_allocation_bounds() {
 }
 
 #[test]
-fn real_callback_records_duration_and_xruns_on_success_and_native_failure() {
+fn real_callback_records_duration_and_xruns_on_success_and_worker_failure() {
     for (tick, expected) in [
         (
-            copy_input_to_output
-                as unsafe extern "C" fn(*mut c_void, *const f32, *mut f32, u32) -> c_int,
+            silence_output as unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> c_int,
             ffi::PA_CONTINUE,
         ),
-        (fail_tick, ffi::PA_ABORT),
+        (fail_transmit, ffi::PA_ABORT),
     ] {
         let stream = prepared_test_stream(&ffi::PRODUCTION_FUNCTIONS, test_config(2, 1, 2, tick));
         let input = [0.25_f32, -0.25, 0.5, -0.5];
@@ -3253,7 +3181,7 @@ fn real_callback_records_duration_and_xruns_on_success_and_native_failure() {
             ffi::PA_CONTINUE
         );
         let result = unsafe {
-            portaudio_callback(
+            playback_callback(
                 input.as_ptr().cast(),
                 output.as_mut_ptr().cast(),
                 2,
@@ -3286,20 +3214,19 @@ fn real_callback_records_duration_and_xruns_on_success_and_native_failure() {
         assert_eq!(stats.input_overflow_count, 1);
         assert_eq!(stats.output_underflow_count, 1);
         assert_eq!(
-            stats.native_tick_failure_count,
+            stats.worker_failure_count,
             u64::from(expected == ffi::PA_ABORT)
         );
         assert_eq!(output, [0.0; 4]);
         assert_eq!(stats.capture_callback_count, 1);
-        assert_eq!(stats.capture_startup_wait_frames, 2);
     }
 }
 
 #[test]
-fn stats_report_capture_queue_and_device_errors() {
+fn stats_report_device_errors() {
     let stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
-        test_config(2, 2, 2, copy_input_to_output),
+        test_config(2, 2, 2, silence_output),
     );
     stream.stats.record_portaudio_error(-321);
     let mut stats = StreamStats {
@@ -3310,12 +3237,6 @@ fn stats_report_capture_queue_and_device_errors() {
     assert_eq!(stream_get_stats(&stream, &mut stats), AUDIO_OK);
     assert_eq!(stats.device_error_count, 1);
     assert_eq!(stats.last_portaudio_error, -321);
-    assert_eq!(stats.input_queue_capacity_frames, 512);
-    assert_eq!(stats.capture_ring_target_frames, 98);
-    assert_eq!(stats.input_queue_occupancy_frames, 0);
-    assert_eq!(stats.output_queue_capacity_frames, 0);
-    assert_eq!(stats.output_queue_occupancy_frames, 0);
-    assert_eq!(stats.output_queue_dropped_frame_count, 0);
 }
 
 #[test]
@@ -3567,20 +3488,23 @@ fn stream_start_inherits_highest_fifo_and_restores_each_caller_policy() {
 }
 
 #[test]
-fn independent_streams_reject_stereo_capture_and_unmatched_rate_before_open() {
+fn independent_streams_accept_stereo_capture_and_reject_unmatched_rate_before_open() {
     let _serial = lock_fake();
     reset_fake_functions();
-    for (channels, rate) in [(2, 48_000), (1, 44_100)] {
-        let mut config = ffi_stream_config();
-        config.input_device_channels = channels;
-        config.native_sample_rate_hz = rate;
-        let mut stream = NonNull::<AudioStream>::dangling().as_ptr();
-        assert_eq!(
-            stream_create_with_functions(&TEST_FUNCTIONS, &config, &mut stream),
-            AUDIO_UNSUPPORTED
-        );
-        assert!(stream.is_null());
-    }
+    let mut config = ffi_stream_config();
+    config.input_device_channels = 2;
+    let stream = fake_stream(&config);
+    stream_destroy(stream);
+
+    reset_fake_functions();
+    config = ffi_stream_config();
+    config.native_sample_rate_hz = 44_100;
+    let mut stream = NonNull::<AudioStream>::dangling().as_ptr();
+    assert_eq!(
+        stream_create_with_functions(&TEST_FUNCTIONS, &config, &mut stream),
+        AUDIO_INVALID_ARGUMENT
+    );
+    assert!(stream.is_null());
     FAKE_PORTAUDIO.with(|state| assert_eq!(state.borrow().initialize_count, 0));
 }
 
@@ -3618,34 +3542,22 @@ fn second_endpoint_open_and_start_failures_release_or_quiesce_capture() {
 }
 
 #[test]
-fn inactive_started_endpoint_is_joined_and_capture_queue_reset_before_restart() {
+fn inactive_started_endpoint_is_joined_before_restart() {
     let _serial = lock_fake();
     reset_fake_functions();
     let stream = fake_stream(&ffi_stream_config());
     assert_eq!(stream_start(stream), AUDIO_OK);
-    unsafe {
-        (*stream).ring.push(&[0.5; 2]).unwrap();
-    }
     // A callback may return PA_ABORT before control notices it has finished.
     FAKE_PORTAUDIO.with(|state| state.borrow_mut().force_active(0));
     assert_eq!(stream_start(stream), AUDIO_OK);
     FAKE_PORTAUDIO.with(|state| assert_eq!(state.borrow().stop_count, 2));
-    assert_eq!(
-        unsafe { (*stream).ring.snapshot().unwrap().occupancy_frames },
-        0
-    );
     stream_destroy(stream);
 }
 
 #[test]
-fn capture_can_publish_while_native_tick_runs_in_disjoint_playback_context() {
+fn capture_can_run_while_transmit_worker_runs_in_disjoint_playback_context() {
     use std::sync::Barrier;
-    unsafe extern "C" fn held_tick(
-        context: *mut c_void,
-        _input: *const f32,
-        output: *mut f32,
-        frames: u32,
-    ) -> c_int {
+    unsafe extern "C" fn held_tick(context: *mut c_void, output: *mut f32, frames: u32) -> c_int {
         let barrier = unsafe { &*context.cast::<Barrier>() };
         barrier.wait();
         barrier.wait();
@@ -3654,13 +3566,13 @@ fn capture_can_publish_while_native_tick_runs_in_disjoint_playback_context() {
     }
     let barrier = Barrier::new(2);
     let mut config = test_config(960, 1, 2, held_tick);
-    config.native_tick_context = (&barrier as *const Barrier).cast_mut().cast();
+    config.transmit_worker_context = (&barrier as *const Barrier).cast_mut().cast();
     let stream = prepared_test_stream(&ffi::PRODUCTION_FUNCTIONS, config);
     let playback = stream.playback.get() as usize;
     let worker = std::thread::spawn(move || {
         let mut output = [1.0_f32; 1920];
         let status = unsafe {
-            portaudio_callback(
+            playback_callback(
                 ptr::null(),
                 output.as_mut_ptr().cast(),
                 960,
@@ -3696,9 +3608,6 @@ fn capture_can_publish_while_native_tick_runs_in_disjoint_playback_context() {
     assert_eq!(stats.input_clip_sample_count, 960);
     assert_eq!(stats.input_peak, 1.0);
     assert_eq!(stats.input_rms, 1.0);
-    assert_eq!(stats.input_queue_occupancy_frames, 960);
-    assert_eq!(stats.capture_startup_wait_frames, 960);
-    assert_eq!(stats.capture_ring_missing_frames, 0);
     barrier.wait();
     worker.join().unwrap();
 }
@@ -3933,7 +3842,7 @@ fn stream_destroy_stops_aborts_or_closes_as_required() {
 
     let raw = Box::into_raw(Box::new(prepared_test_stream(
         &TEST_FUNCTIONS,
-        test_config(2, 1, 1, copy_input_to_output),
+        test_config(2, 1, 1, silence_output),
     )));
     stream_destroy(raw);
 }
@@ -3942,7 +3851,7 @@ fn stream_destroy_stops_aborts_or_closes_as_required() {
 fn stream_stats_reject_invalid_pointers_and_short_structures() {
     let stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
-        test_config(2, 1, 1, copy_input_to_output),
+        test_config(2, 1, 1, silence_output),
     );
     let mut stats = StreamStats::default();
 
@@ -3964,7 +3873,7 @@ fn stream_stats_reject_invalid_pointers_and_short_structures() {
 fn callback_handles_null_input_null_output_and_zero_frames() {
     let mut stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
-        test_config(2, 1, 1, copy_input_to_output),
+        test_config(2, 1, 1, silence_output),
     );
     let mut output = [1.0; 2];
     assert_eq!(
@@ -3982,16 +3891,10 @@ fn callback_handles_null_input_null_output_and_zero_frames() {
         ffi::PA_CONTINUE
     );
     assert_eq!(stream.stats.callback_count.load(Ordering::Acquire), 2);
-    assert_eq!(
-        stream
-            .stats
-            .native_tick_failure_count
-            .load(Ordering::Acquire),
-        1
-    );
+    assert_eq!(stream.stats.worker_failure_count.load(Ordering::Acquire), 1);
     assert_eq!(
         unsafe {
-            portaudio_callback(
+            playback_callback(
                 ptr::null(),
                 ptr::null_mut(),
                 0,
@@ -4008,7 +3911,7 @@ fn callback_handles_null_input_null_output_and_zero_frames() {
 fn callback_preserves_stereo_physical_channels() {
     let mut stream = prepared_test_stream(
         &ffi::PRODUCTION_FUNCTIONS,
-        test_config(2, 2, 2, copy_input_to_output),
+        test_config(2, 2, 2, stereo_pattern_output),
     );
     let input = [0.125, -0.25, 0.5, -0.75];
     let mut output = [0.0; 4];
@@ -4017,7 +3920,7 @@ fn callback_preserves_stereo_physical_channels() {
         unsafe { stream.process_callback(input.as_ptr(), output.as_mut_ptr(), 2, 0) },
         ffi::PA_CONTINUE
     );
-    assert_eq!(output, input);
+    assert_eq!(output, [0.125, -0.25, 0.5, -0.75]);
 }
 
 #[test]

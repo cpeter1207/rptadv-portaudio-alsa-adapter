@@ -10,16 +10,11 @@ CPPHECK ?= cppcheck
 READELF ?= readelf
 CC ?= cc
 PYTHON ?= python3
-PKG_CONFIG ?= pkg-config
-RING_PACKAGE := rate_adjusting_pcm_ring2
-RING_MIN_VERSION := 2.0.0~alpha1
-RING_LINK_FLAGS = $(shell $(PKG_CONFIG) --libs-only-L $(RING_PACKAGE))
-RING_RUSTFLAGS = $(foreach flag,$(RING_LINK_FLAGS),-C link-arg=$(flag))
 
 PACKAGE := rptadv-portaudio-alsa-adapter
 CRATE := rptadv_portaudio_alsa_adapter
-PACKAGE_VERSION ?= 0.1.0-alpha.2
-SOVERSION := 1
+PACKAGE_VERSION ?= 0.2.0-alpha.1
+SOVERSION := 2
 PREFIX ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib
@@ -42,7 +37,7 @@ DEBIAN_MULTIARCH = $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 DEBIAN_SOURCE_PARENT = build/debian-source
 DEBIAN_SOURCE_DIR = $(DEBIAN_SOURCE_PARENT)/$(PACKAGE)-$(PACKAGE_VERSION)
 DEBIAN_OUTPUT_DIR = $(abspath $(DEBIAN_SOURCE_PARENT))
-DEBIAN_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librptadv-portaudio-alsa-adapter1_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
+DEBIAN_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librptadv-portaudio-alsa-adapter2_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_DEV_DEB = $(DEBIAN_OUTPUT_DIR)/librptadv-portaudio-alsa-adapter-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_STAGE = build/debian-package-stage
 COVERAGE_TOOLCHAIN ?= nightly-2025-02-20
@@ -57,20 +52,17 @@ QUALITY_LAUNCHER = tools/run-in-quality-container.sh
 
 # Rust emits the ABI-major SONAME while this Makefile creates the conventional
 # versioned file and linker symlinks used by Debian and pkg-config consumers.
-SONAME_RUSTFLAGS = $(RUSTFLAGS) $(RING_RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
+SONAME_RUSTFLAGS = $(RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
 
 .PHONY: all quality lint static-analysis docs test coverage install install-check \
-	debian-package-check dist distcheck platform-verify ci quality-image container-coverage clean check-dependencies FORCE
+	debian-package-check dist distcheck platform-verify ci quality-image container-coverage clean FORCE
 
 all: $(LIBRARY_VERSIONED) $(LIBRARY_SONAME) $(LIBRARY_LINK)
 
 build:
 	mkdir -p $@
 
-check-dependencies:
-	$(PKG_CONFIG) --atleast-version=$(RING_MIN_VERSION) $(RING_PACKAGE)
-
-$(TARGET_LIBRARY): Cargo.toml Cargo.lock $(RUST_SOURCES) | check-dependencies
+$(TARGET_LIBRARY): Cargo.toml Cargo.lock $(RUST_SOURCES)
 	RUSTFLAGS="$(SONAME_RUSTFLAGS)" $(CARGO) build --release --locked
 
 $(LIBRARY_VERSIONED): $(TARGET_LIBRARY) | build
@@ -94,17 +86,18 @@ lint:
 	$(CARGO_FMT) --check
 	$(SHELLCHECK) tools/run-in-quality-container.sh
 
-static-analysis: check-dependencies
-	RUSTFLAGS="$(RUSTFLAGS) $(RING_RUSTFLAGS)" $(CARGO_CLIPPY) --all-targets --all-features -- -D warnings
+static-analysis:
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO_CLIPPY) --all-targets --all-features -- -D warnings
 	$(CPPHECK) --force --enable=warning,style,performance,portability \
 		--error-exitcode=1 --std=c11 -Iinclude $(C_SMOKE_SOURCE)
 
 docs: | build
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --lib --no-deps --locked --document-private-items
 	$(DOXYGEN) Doxyfile
 	test ! -s build/doxygen-warnings.log
 
-test: check-dependencies
-	RUSTFLAGS="$(RUSTFLAGS) $(RING_RUSTFLAGS)" $(CARGO) test --all-targets --locked
+test:
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) test --all-targets --locked
 	$(MAKE) $(C_SMOKE_BINARY)
 	./$(C_SMOKE_BINARY)
 
@@ -118,10 +111,10 @@ $(C_SMOKE_BINARY): $(C_SMOKE_SOURCE) $(HEADER) $(LIBRARY_LINK) | build
 # audit also explicitly excludes the in-tree `src/tests.rs` test module, then
 # rejects any uncovered production lines or branches rather than relying on a
 # formatted summary intended for people.
-coverage: check-dependencies
+coverage:
 	rm -rf $(COVERAGE_DIR) $(COVERAGE_TARGET_DIR)
 	mkdir -p $(COVERAGE_DIR)
-	RUSTFLAGS="$(RUSTFLAGS) $(RING_RUSTFLAGS)" \
+	RUSTFLAGS="$(RUSTFLAGS)" \
 		RUSTUP_TOOLCHAIN=$(COVERAGE_TOOLCHAIN) CARGO_LLVM_COV_TARGET_DIR=$(abspath $(COVERAGE_TARGET_DIR)) \
 		$(CARGO_LLVM_COV) --all-targets --locked --branch --json \
 		--output-path $(COVERAGE_JSON)
@@ -160,7 +153,7 @@ install-check: all
 		grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'libportaudio.so'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'libasound.so'
-	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librate_adjusting_pcm_ring2.so.2'
+	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'librate_adjusting_pcm_ring'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'res_usbradio.so'
 	test -f build/stage/usr/include/rptadv_portaudio_alsa_adapter/$(notdir $(HEADER))
 	test -f build/stage/usr/lib/pkgconfig/rptadv_portaudio_alsa_adapter.pc
@@ -194,8 +187,8 @@ debian-package-check: dist
 		grep -F 'libportaudio.so'
 	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
 		grep -F 'libasound.so'
-	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
-		grep -F 'librate_adjusting_pcm_ring2.so.2'
+	! $(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
+		grep -F 'librate_adjusting_pcm_ring'
 	! $(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
 		grep -F 'res_usbradio.so'
 
@@ -206,6 +199,7 @@ dist: | build
 		--exclude=debian/.debhelper --exclude=debian/debhelper-build-stamp \
 		--exclude=debian/files --exclude=debian/tmp \
 		--exclude=debian/librptadv-portaudio-alsa-adapter1 \
+		--exclude=debian/librptadv-portaudio-alsa-adapter2 \
 		--exclude=debian/librptadv-portaudio-alsa-adapter-dev \
 		--exclude='debian/*.substvars' --exclude='debian/*.debhelper.log' \
 		--transform='s|^|$(PACKAGE)-$(PACKAGE_VERSION)/|' -czf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz \
@@ -214,7 +208,7 @@ dist: | build
 
 distcheck: dist
 	! tar -tzf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz | \
-		grep -E '/debian/(\.debhelper/|debhelper-build-stamp$$|files$$|tmp/|librptadv-portaudio-alsa-adapter(1|-dev)/|.*\.(substvars|debhelper\.log)$$)'
+		grep -E '/debian/(\.debhelper/|debhelper-build-stamp$$|files$$|tmp/|librptadv-portaudio-alsa-adapter([0-9]+|-dev)/|.*\.(substvars|debhelper\.log)$$)'
 	rm -rf build/dist-unpacked
 	mkdir -p build/dist-unpacked
 	tar -C build/dist-unpacked -xzf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz

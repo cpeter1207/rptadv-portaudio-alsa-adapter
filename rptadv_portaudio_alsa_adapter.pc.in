@@ -6,6 +6,5 @@ includedir=${prefix}/include
 Name: rptadv_portaudio_alsa_adapter
 Description: PortAudio and ALSA hardware audio adapter for rpt_advanced
 Version: @VERSION@
-Requires.private: rate_adjusting_pcm_ring2 >= 2.0.0~alpha1
 Libs: -L${libdir} -lrptadv_portaudio_alsa_adapter
 Cflags: -I${includedir}
