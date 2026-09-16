@@ -134,6 +134,7 @@ int main(void)
 	assert(RPTADV_AUDIO_CM119_MIXER_ELEMENT_NAME_CAPACITY >= 19U);
 	assert(RPTADV_AUDIO_MIXER_NORMALIZED_MINIMUM == 0U);
 	assert(RPTADV_AUDIO_MIXER_NORMALIZED_MAXIMUM == 999U);
+	assert(RPTADV_AUDIO_SCHEDULING_UNKNOWN == -1);
 	assert(stats.abi_version == 0);
 	assert(stats.callback_count == 0);
 	assert(stats.callback_frame_count == 0);
@@ -148,6 +149,12 @@ int main(void)
 	assert(stats.output_peak == 0.0F);
 	assert(stats.output_rms == 0.0F);
 	assert(stats.last_portaudio_error == 0);
+	assert(stats.capture_scheduling_policy == 0);
+	assert(stats.capture_scheduling_priority == 0);
+	assert(stats.capture_scheduling_limited == 0U);
+	assert(stats.playback_scheduling_policy == 0);
+	assert(stats.playback_scheduling_priority == 0);
+	assert(stats.playback_scheduling_limited == 0U);
 	assert(timing.abi_version == 0);
 	assert(timing.input_latency_seconds == 0.0);
 	assert(timing.output_latency_seconds == 0.0);

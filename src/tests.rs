@@ -300,8 +300,10 @@ struct FakeSchedulingState {
     maximum: c_int,
     get_result: c_int,
     set_results: VecDeque<c_int>,
+    default_set_result: c_int,
     set_requests: Vec<(c_int, c_int)>,
     start_schedule: Option<(c_int, c_int)>,
+    start_schedules: Vec<(c_int, c_int)>,
     events: Vec<&'static str>,
 }
 
@@ -619,7 +621,10 @@ unsafe extern "C" fn fake_set_scheduling(
         let mut state = state.borrow_mut();
         state.events.push("set");
         state.set_requests.push((policy, priority));
-        let result = state.set_results.pop_front().unwrap_or(0);
+        let result = state
+            .set_results
+            .pop_front()
+            .unwrap_or(state.default_set_result);
         if result == 0 {
             state.policy = policy;
             state.priority = priority;
@@ -642,6 +647,8 @@ unsafe extern "C" fn fake_pa_start_stream(stream: *mut PaStream) -> PaError {
         let mut state = state.borrow_mut();
         state.events.push("start");
         state.start_schedule = Some((state.policy, state.priority));
+        let schedule = (state.policy, state.priority);
+        state.start_schedules.push(schedule);
     });
     FAKE_PORTAUDIO.with(|state| {
         let mut state = state.borrow_mut();
@@ -1539,6 +1546,15 @@ fn fake_stream(config: &StreamConfig) -> *mut AudioStream {
     );
     assert!(!stream.is_null());
     stream
+}
+
+fn fake_stream_stats(stream: *const AudioStream) -> StreamStats {
+    let mut stats = StreamStats {
+        struct_size: size_of::<StreamStats>() as u32,
+        ..StreamStats::default()
+    };
+    assert_eq!(stream_get_stats(stream, &mut stats), AUDIO_OK);
+    stats
 }
 
 fn fake_mixer(config: &MixerConfig) -> *mut AudioMixer {
@@ -3155,6 +3171,42 @@ fn stream_stats_preserve_future_caller_allocation_bounds() {
 }
 
 #[test]
+fn stream_stats_accept_the_original_abi_two_prefix() {
+    const ORIGINAL_ABI_TWO_SIZE: usize = 184;
+    #[repr(C, align(8))]
+    struct OriginalStorage {
+        bytes: [u8; ORIGINAL_ABI_TWO_SIZE],
+        canary: [u8; 16],
+    }
+    let stream = prepared_test_stream(
+        &ffi::PRODUCTION_FUNCTIONS,
+        test_config(2, 2, 2, stereo_pattern_output),
+    );
+    stream.stats.callback_count.store(17, Ordering::Relaxed);
+    let mut storage = OriginalStorage {
+        bytes: [0; ORIGINAL_ABI_TWO_SIZE],
+        canary: [0x5a; 16],
+    };
+    unsafe {
+        storage
+            .bytes
+            .as_mut_ptr()
+            .cast::<u32>()
+            .write(ORIGINAL_ABI_TWO_SIZE as u32);
+    }
+
+    assert_eq!(
+        stream_get_stats(&stream, storage.bytes.as_mut_ptr().cast::<StreamStats>(),),
+        AUDIO_OK
+    );
+    assert_eq!(storage.canary, [0x5a; 16]);
+    assert_eq!(
+        unsafe { storage.bytes.as_ptr().add(8).cast::<u64>().read() },
+        17
+    );
+}
+
+#[test]
 fn real_callback_records_duration_and_xruns_on_success_and_worker_failure() {
     for (tick, expected) in [
         (
@@ -3454,34 +3506,142 @@ fn stream_create_releases_runtime_after_all_device_and_open_failures() {
 }
 
 #[test]
-fn stream_start_inherits_highest_fifo_and_restores_each_caller_policy() {
+fn stream_start_uses_best_available_scheduling_for_both_callback_workers() {
     let _serial = lock_fake();
-    for (policy, priority, maximum) in [(0, 0, 99), (2, 10, 99), (1, 99, 99), (2, 10, 73)] {
+    struct Case {
+        name: &'static str,
+        inherited: (c_int, c_int),
+        maximum: c_int,
+        get_result: c_int,
+        set_results: &'static [c_int],
+        default_set_result: c_int,
+        callback_schedule: (c_int, c_int),
+        reported_schedule: (c_int, c_int),
+        limited: u32,
+        set_count: usize,
+    }
+    for case in [
+        Case {
+            name: "maximum",
+            inherited: (0, 0),
+            maximum: 99,
+            get_result: 0,
+            set_results: &[],
+            default_set_result: 0,
+            callback_schedule: (ffi::SCHED_FIFO, 99),
+            reported_schedule: (ffi::SCHED_FIFO, 99),
+            limited: 0,
+            set_count: 2,
+        },
+        Case {
+            name: "lower permitted",
+            inherited: (2, 10),
+            maximum: 99,
+            get_result: 0,
+            set_results: &[1, 1, 0],
+            default_set_result: 0,
+            callback_schedule: (ffi::SCHED_FIFO, 97),
+            reported_schedule: (ffi::SCHED_FIFO, 97),
+            limited: 1,
+            set_count: 4,
+        },
+        Case {
+            name: "no permitted elevation",
+            inherited: (2, 10),
+            maximum: 99,
+            get_result: 0,
+            set_results: &[],
+            default_set_result: 1,
+            callback_schedule: (2, 10),
+            reported_schedule: (2, 10),
+            limited: 1,
+            set_count: 99,
+        },
+        Case {
+            name: "unavailable metadata",
+            inherited: (2, 10),
+            maximum: 99,
+            get_result: 22,
+            set_results: &[],
+            default_set_result: 0,
+            callback_schedule: (2, 10),
+            reported_schedule: (-1, -1),
+            limited: 1,
+            set_count: 0,
+        },
+        Case {
+            name: "already adequate",
+            inherited: (ffi::SCHED_FIFO, 99),
+            maximum: 99,
+            get_result: 0,
+            set_results: &[],
+            default_set_result: 0,
+            callback_schedule: (ffi::SCHED_FIFO, 99),
+            reported_schedule: (ffi::SCHED_FIFO, 99),
+            limited: 0,
+            set_count: 0,
+        },
+        Case {
+            name: "kernel-limited adequate",
+            inherited: (ffi::SCHED_FIFO, 73),
+            maximum: 73,
+            get_result: 0,
+            set_results: &[],
+            default_set_result: 0,
+            callback_schedule: (ffi::SCHED_FIFO, 73),
+            reported_schedule: (ffi::SCHED_FIFO, 73),
+            limited: 1,
+            set_count: 0,
+        },
+        Case {
+            name: "raise inherited fifo",
+            inherited: (ffi::SCHED_FIFO, 50),
+            maximum: 99,
+            get_result: 0,
+            set_results: &[],
+            default_set_result: 0,
+            callback_schedule: (ffi::SCHED_FIFO, 99),
+            reported_schedule: (ffi::SCHED_FIFO, 99),
+            limited: 0,
+            set_count: 2,
+        },
+    ] {
         reset_fake_functions();
         FAKE_SCHEDULING.with(|state| {
             let mut state = state.borrow_mut();
-            state.policy = policy;
-            state.priority = priority;
-            state.maximum = maximum;
+            state.policy = case.inherited.0;
+            state.priority = case.inherited.1;
+            state.maximum = case.maximum;
+            state.get_result = case.get_result;
+            state.set_results.extend(case.set_results);
+            state.default_set_result = case.default_set_result;
         });
         let stream = fake_stream(&ffi_stream_config());
-        assert_eq!(stream_start(stream), AUDIO_OK);
+        assert_eq!(stream_start(stream), AUDIO_OK, "{}", case.name);
         FAKE_SCHEDULING.with(|state| {
             let state = state.borrow();
-            assert_eq!(state.start_schedule, Some((ffi::SCHED_FIFO, maximum)));
-            assert_eq!((state.policy, state.priority), (policy, priority));
             assert_eq!(
-                state.set_requests,
-                [(ffi::SCHED_FIFO, maximum), (policy, priority)]
+                state.start_schedules,
+                [case.callback_schedule, case.callback_schedule]
             );
-            assert_eq!(
-                state.events,
-                ["self", "get", "max", "set", "start", "start", "set"]
-            );
+            assert_eq!((state.policy, state.priority), case.inherited);
+            assert_eq!(state.set_requests.len(), case.set_count, "{}", case.name);
+            if case.name == "no permitted elevation" {
+                assert_eq!(state.set_requests.first(), Some(&(ffi::SCHED_FIFO, 99)));
+                assert_eq!(state.set_requests.last(), Some(&(ffi::SCHED_FIFO, 1)));
+            }
         });
+        let stats = fake_stream_stats(stream);
+        assert_eq!(stats.capture_scheduling_policy, case.reported_schedule.0);
+        assert_eq!(stats.capture_scheduling_priority, case.reported_schedule.1);
+        assert_eq!(stats.capture_scheduling_limited, case.limited);
+        assert_eq!(stats.playback_scheduling_policy, case.reported_schedule.0);
+        assert_eq!(stats.playback_scheduling_priority, case.reported_schedule.1);
+        assert_eq!(stats.playback_scheduling_limited, case.limited);
+        assert_eq!(stats.device_error_count, 0);
         // An already-running callback needs no second scheduling or start operation.
         assert_eq!(stream_start(stream), AUDIO_OK);
-        FAKE_SCHEDULING.with(|state| assert_eq!(state.borrow().set_requests.len(), 2));
+        FAKE_SCHEDULING.with(|state| assert_eq!(state.borrow().set_requests.len(), case.set_count));
         FAKE_PORTAUDIO.with(|state| assert_eq!(state.borrow().start_count, 2));
         stream_destroy(stream);
     }
@@ -3613,46 +3773,34 @@ fn capture_can_run_while_transmit_worker_runs_in_disjoint_playback_context() {
 }
 
 #[test]
-fn stream_start_rejects_scheduling_setup_failures_before_callbacks_start() {
+fn stream_start_continues_when_priority_metadata_has_no_usable_maximum() {
     let _serial = lock_fake();
-    for failure in 0..4 {
+    for maximum in [-1, 0] {
         reset_fake_functions();
-        FAKE_SCHEDULING.with(|state| {
-            let mut state = state.borrow_mut();
-            match failure {
-                0 => state.get_result = 22,
-                1 => state.maximum = -1,
-                2 => state.maximum = 0,
-                _ => state.set_results.push_back(1), // EPERM from pthread_setschedparam.
-            }
-        });
+        FAKE_SCHEDULING.with(|state| state.borrow_mut().maximum = maximum);
         let stream = fake_stream(&ffi_stream_config());
-        assert_eq!(stream_start(stream), AUDIO_PORTAUDIO_ERROR);
+        assert_eq!(stream_start(stream), AUDIO_OK);
         FAKE_PORTAUDIO.with(|state| {
             let state = state.borrow();
             assert_eq!(
                 (state.start_count, state.abort_count, state.active),
-                (0, 0, 0)
+                (2, 0, 1)
             );
         });
         FAKE_SCHEDULING.with(|state| {
             let state = state.borrow();
             assert_eq!((state.policy, state.priority), (2, 10));
-            assert_eq!(state.start_schedule, None);
-            let expected: &[&str] = match failure {
-                0 => &["self", "get"],
-                1 | 2 => &["self", "get", "max"],
-                _ => &["self", "get", "max", "set"],
-            };
-            assert_eq!(state.events, expected);
+            assert_eq!(state.start_schedules, [(2, 10), (2, 10)]);
+            assert!(state.set_requests.is_empty());
         });
-        let mut stats = StreamStats {
-            struct_size: size_of::<StreamStats>() as u32,
-            ..StreamStats::default()
-        };
-        assert_eq!(stream_get_stats(stream, &mut stats), AUDIO_OK);
-        assert_eq!(stats.device_error_count, 1);
-        assert_eq!(stats.last_portaudio_error, ffi::PA_INTERNAL_ERROR);
+        let stats = fake_stream_stats(stream);
+        assert_eq!(stats.capture_scheduling_policy, 2);
+        assert_eq!(stats.capture_scheduling_priority, 10);
+        assert_eq!(stats.capture_scheduling_limited, 1);
+        assert_eq!(stats.playback_scheduling_policy, 2);
+        assert_eq!(stats.playback_scheduling_priority, 10);
+        assert_eq!(stats.playback_scheduling_limited, 1);
+        assert_eq!(stats.device_error_count, 0);
         stream_destroy(stream);
     }
 }

@@ -29,6 +29,9 @@ extern "C" {
 /** @brief Select PortAudio's default input or output device. */
 #define RPTADV_AUDIO_DEFAULT_DEVICE (-1)
 
+/** @brief Scheduling policy or priority could not be queried at stream start. */
+#define RPTADV_AUDIO_SCHEDULING_UNKNOWN (-1)
+
 /** @brief Lowest portable normalized ALSA mixer setting. */
 #define RPTADV_AUDIO_MIXER_NORMALIZED_MINIMUM 0U
 
@@ -201,6 +204,18 @@ struct rptadv_audio_stream_stats {
 	uint64_t callback_clock_error_count;
 	/** Number of PortAudio capture callbacks processed. */
 	uint64_t capture_callback_count;
+	/** Linux scheduling policy inherited by the capture callback, or -1 if unknown. */
+	int32_t capture_scheduling_policy;
+	/** Linux scheduling priority inherited by capture, or -1 if unknown. */
+	int32_t capture_scheduling_priority;
+	/** Nonzero when capture could not inherit preferred FIFO priority 99. */
+	uint32_t capture_scheduling_limited;
+	/** Linux scheduling policy inherited by the playback callback, or -1 if unknown. */
+	int32_t playback_scheduling_policy;
+	/** Linux scheduling priority inherited by playback, or -1 if unknown. */
+	int32_t playback_scheduling_priority;
+	/** Nonzero when playback could not inherit preferred FIFO priority 99. */
+	uint32_t playback_scheduling_limited;
 };
 
 /**
@@ -473,12 +488,15 @@ struct rptadv_audio_adapter_descriptor {
 		const struct rptadv_audio_stream_config *config,
 		struct rptadv_audio_stream **stream);
 	/**
-	 * @brief Start callbacks at the highest Linux FIFO priority.
+	 * @brief Start callbacks at the highest permitted Linux FIFO priority.
 	 *
-	 * The caller needs permission for that priority (normally 99). Its original
-	 * scheduling state is restored after PortAudio starts the callback thread.
-	 * Scheduling failure returns a PortAudio error and records an internal error
-	 * in stream statistics; restoration failure aborts a successfully started stream.
+	 * The adapter first tries priority 99 and then lower FIFO priorities. If
+	 * elevation or scheduling metadata is unavailable, callbacks inherit the
+	 * caller's existing scheduling and startup continues. Stream statistics
+	 * report the actual inherited policy/priority, or -1 when querying them was
+	 * impossible, plus a nonfatal limitation flag. A caller scheduling change is
+	 * restored after PortAudio starts both callbacks; restoration failure aborts
+	 * a successfully started stream.
 	 */
 	enum rptadv_audio_result (*stream_start)(struct rptadv_audio_stream *stream);
 	/** Stop callbacks for a running stream. */

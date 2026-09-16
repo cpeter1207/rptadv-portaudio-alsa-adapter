@@ -46,6 +46,8 @@ const CM119_MIXER_PATH_SWITCH: u32 = 1 << 1;
 const CM119_RX_BOOST_ELEMENT: &[u8] = b"Auto Gain Control";
 const USB_SELECTION_EXACT: u32 = 0;
 const USB_SELECTION_AUTOMATIC_LOWEST_ALSA_CARD: u32 = 1;
+const DESIRED_FIFO_PRIORITY: c_int = 99;
+const SCHEDULING_UNKNOWN: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.portaudio-alsa-audio\0";
 
 type ReceiveWorker = Option<unsafe extern "C" fn(*mut c_void, *const f32, u32) -> i32>;
@@ -99,7 +101,17 @@ struct StreamStats {
     last_output_xrun_monotonic_ns: u64,
     callback_clock_error_count: u64,
     capture_callback_count: u64,
+    capture_scheduling_policy: i32,
+    capture_scheduling_priority: i32,
+    capture_scheduling_limited: u32,
+    playback_scheduling_policy: i32,
+    playback_scheduling_priority: i32,
+    playback_scheduling_limited: u32,
 }
+
+/// Size published by the original ABI-2 statistics structure.
+const STREAM_STATS_ABI_TWO_PREFIX_SIZE: u32 =
+    std::mem::offset_of!(StreamStats, capture_scheduling_policy) as u32;
 
 /// Ignore ordinary sub-millisecond callback arrival jitter in the late-start count.
 const CALLBACK_LATE_TOLERANCE_NS: u64 = 1_000_000;
@@ -335,9 +347,42 @@ struct SharedStats {
     callback_clock_error_count: AtomicU64,
     previous_callback_start_ns: AtomicU64,
     previous_callback_period_ns: AtomicU64,
+    capture_scheduling_policy: AtomicI32,
+    capture_scheduling_priority: AtomicI32,
+    capture_scheduling_limited: AtomicU32,
+    playback_scheduling_policy: AtomicI32,
+    playback_scheduling_priority: AtomicI32,
+    playback_scheduling_limited: AtomicU32,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulingSelection {
+    changed: bool,
+    policy: c_int,
+    priority: c_int,
+    limited: bool,
 }
 
 impl SharedStats {
+    fn record_scheduling(&self, capture: bool, selection: SchedulingSelection) {
+        let (policy, priority, limited) = if capture {
+            (
+                &self.capture_scheduling_policy,
+                &self.capture_scheduling_priority,
+                &self.capture_scheduling_limited,
+            )
+        } else {
+            (
+                &self.playback_scheduling_policy,
+                &self.playback_scheduling_priority,
+                &self.playback_scheduling_limited,
+            )
+        };
+        policy.store(selection.policy, Ordering::Release);
+        priority.store(selection.priority, Ordering::Release);
+        limited.store(u32::from(selection.limited), Ordering::Release);
+    }
+
     fn record_capture_overflow_timestamp(&self, now: u64) {
         if now != 0 {
             self.last_input_xrun_monotonic_ns
@@ -436,6 +481,15 @@ impl SharedStats {
             self.last_output_xrun_monotonic_ns.load(Ordering::Acquire);
         stats.callback_clock_error_count = self.callback_clock_error_count.load(Ordering::Acquire);
         stats.capture_callback_count = self.capture_callback_count.load(Ordering::Acquire);
+        stats.capture_scheduling_policy = self.capture_scheduling_policy.load(Ordering::Acquire);
+        stats.capture_scheduling_priority =
+            self.capture_scheduling_priority.load(Ordering::Acquire);
+        stats.capture_scheduling_limited = self.capture_scheduling_limited.load(Ordering::Acquire);
+        stats.playback_scheduling_policy = self.playback_scheduling_policy.load(Ordering::Acquire);
+        stats.playback_scheduling_priority =
+            self.playback_scheduling_priority.load(Ordering::Acquire);
+        stats.playback_scheduling_limited =
+            self.playback_scheduling_limited.load(Ordering::Acquire);
     }
 }
 
@@ -1102,6 +1156,59 @@ extern "C" fn stream_create(config: *const StreamConfig, stream: *mut *mut Audio
     stream_create_with_functions(&ffi::PRODUCTION_FUNCTIONS, config, stream)
 }
 
+/// Select the highest available FIFO priority without lowering an inherited
+/// real-time priority. Failure to elevate is a reported limitation, not an
+/// audio-device error.
+fn select_scheduling(
+    scheduling: &ffi::SchedulingFunctions,
+    thread: ffi::Pthread,
+    policy: c_int,
+    priority: c_int,
+) -> SchedulingSelection {
+    let maximum = unsafe { (scheduling.priority_max)(ffi::SCHED_FIFO) };
+    if maximum < 1 {
+        return SchedulingSelection {
+            changed: false,
+            policy,
+            priority,
+            limited: true,
+        };
+    }
+    let desired = maximum.min(DESIRED_FIFO_PRIORITY);
+    if policy == ffi::SCHED_FIFO && priority >= desired {
+        return SchedulingSelection {
+            changed: false,
+            policy,
+            priority,
+            limited: priority < DESIRED_FIFO_PRIORITY,
+        };
+    }
+    let minimum = if policy == ffi::SCHED_FIFO {
+        priority.saturating_add(1).max(1)
+    } else {
+        1
+    };
+    for candidate in (minimum..=desired).rev() {
+        let parameter = ffi::SchedParam {
+            sched_priority: candidate,
+        };
+        if unsafe { (scheduling.set)(thread, ffi::SCHED_FIFO, &parameter) } == 0 {
+            return SchedulingSelection {
+                changed: true,
+                policy: ffi::SCHED_FIFO,
+                priority: candidate,
+                limited: candidate < DESIRED_FIFO_PRIORITY,
+            };
+        }
+    }
+    SchedulingSelection {
+        changed: false,
+        policy,
+        priority,
+        limited: true,
+    }
+}
+
 extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     let Some(stream) = NonNull::new(stream) else {
         return AUDIO_INVALID_ARGUMENT;
@@ -1127,24 +1234,18 @@ extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     // Elevate only this lifecycle call, then restore the caller on every path.
     let scheduling = &stream.functions.scheduling;
     let thread = unsafe { (scheduling.thread_self)() };
-    let mut policy = 0;
+    let mut policy = SCHEDULING_UNKNOWN;
     let mut saved = ffi::SchedParam::default();
-    if unsafe { (scheduling.get)(thread, &mut policy, &mut saved) } != 0 {
-        stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
-    let priority = unsafe { (scheduling.priority_max)(ffi::SCHED_FIFO) };
-    if priority < 1 {
-        stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
-    let highest = ffi::SchedParam {
-        sched_priority: priority,
+    let selection = if unsafe { (scheduling.get)(thread, &mut policy, &mut saved) } == 0 {
+        select_scheduling(scheduling, thread, policy, saved.sched_priority)
+    } else {
+        SchedulingSelection {
+            changed: false,
+            policy: SCHEDULING_UNKNOWN,
+            priority: SCHEDULING_UNKNOWN,
+            limited: true,
+        }
     };
-    if unsafe { (scheduling.set)(thread, ffi::SCHED_FIFO, &highest) } != 0 {
-        stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
     // A stopped interval is not a scheduling delay on the next callback.
     stream
         .stats
@@ -1157,12 +1258,18 @@ extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     let mut result = unsafe { (stream.functions.portaudio.start_stream)(stream.capture_stream) };
     if result == ffi::PA_NO_ERROR {
         stream.started[1].store(true, Ordering::Relaxed);
+        stream.stats.record_scheduling(true, selection);
         result = unsafe { (stream.functions.portaudio.start_stream)(stream.playback_stream) };
         if result == ffi::PA_NO_ERROR {
             stream.started[0].store(true, Ordering::Relaxed);
+            stream.stats.record_scheduling(false, selection);
         }
     }
-    let restore = unsafe { (scheduling.set)(thread, policy, &saved) };
+    let restore = if selection.changed {
+        unsafe { (scheduling.set)(thread, policy, &saved) }
+    } else {
+        0
+    };
     if result != ffi::PA_NO_ERROR || restore != 0 {
         for (index, handle) in [stream.playback_stream, stream.capture_stream]
             .into_iter()
@@ -1207,7 +1314,7 @@ extern "C" fn stream_get_stats(stream: *const AudioStream, stats: *mut StreamSta
     };
     // Read only the header until the caller's allocation size is known.
     let supplied_size = unsafe { ptr::addr_of!((*stats.as_ptr()).struct_size).read() };
-    if supplied_size < size_of::<StreamStats>() as u32 {
+    if supplied_size < STREAM_STATS_ABI_TWO_PREFIX_SIZE {
         return AUDIO_INVALID_ARGUMENT;
     }
     let stream = unsafe { stream.as_ref() };

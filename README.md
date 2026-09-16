@@ -70,16 +70,23 @@ playback run independently: capture dispatches each input block directly to the
 receive worker, and playback asks the transmit worker to fill each output block.
 The owning radio core is responsible for any path that bridges the two device
 clocks. The adapter contains no PCM ring or resampler.
-Both callbacks must run at the highest `SCHED_FIFO` priority (99 on Linux).
-Stream startup temporarily applies that policy to the calling thread so the
-PortAudio ALSA callback inherits it, then restores the caller's original policy
-and priority. PortAudio 19.6's ALSA realtime helper is not used because it selects
-FIFO priority 1. The service needs permission for priority 99, for example
-`LimitRTPRIO=99` in its systemd unit or equivalent `CAP_SYS_NICE` authorization.
-Scheduling setup failure prevents stream start. Restoration failure aborts a
-successfully started stream and reports an error; scheduling failures appear as
-PortAudio internal errors in the existing statistics. No scheduling calls run
-inside an audio callback.
+Both callbacks prefer `SCHED_FIFO` priority 99 on Linux. Stream startup
+temporarily tries that policy on the calling thread, then lower FIFO priorities
+until one succeeds, so the PortAudio ALSA callbacks inherit the best permitted
+setting. If scheduling metadata or elevation is unavailable, callbacks inherit
+the caller's unchanged scheduling and audio startup continues. PortAudio 19.6's
+ALSA realtime helper is not used because it selects FIFO priority 1. A service
+may permit priority 99 with `LimitRTPRIO=99` or equivalent `CAP_SYS_NICE`
+authorization, but that permission is not required for startup.
+
+Stream statistics report the policy and priority inherited by capture and
+playback, plus a nonfatal limitation flag when priority 99 was not obtained.
+Policy and priority are `-1` only when the operating system would not return
+scheduling metadata. These fields append the original ABI-2 statistics prefix,
+so an ABI-2 caller may continue supplying its original smaller structure.
+Restoration failure after a successful temporary scheduling change still aborts
+the started stream and reports an error. No scheduling calls run inside an audio
+callback.
 After opening, `stream_get_timing` reports PortAudio's actual input/output
 latency estimates and actual sample-rate estimate without exposing a PortAudio
 type. It accepts PortAudio 19.6 ALSA's zero stream-info version while validating
