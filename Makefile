@@ -13,7 +13,7 @@ PYTHON ?= python3
 
 PACKAGE := rptadv-portaudio-alsa-adapter
 CRATE := rptadv_portaudio_alsa_adapter
-PACKAGE_VERSION ?= 0.2.0-alpha.1
+PACKAGE_VERSION ?= 0.2.0-alpha.2
 SOVERSION := 2
 PREFIX ?= /usr/local
 DESTDIR ?=

@@ -28,7 +28,7 @@ S16 Asterisk and CM119 boundaries.
 
 ## Status
 
-Version `0.2.0-alpha.1` packages separate input-paced receive and DAC-paced
+Version `0.2.0-alpha.2` packages separate input-paced receive and DAC-paced
 transmit workers as a Rust `cdylib` with ABI major 2. Release publication requires
 the full pull-request quality gate, including native Debian 13 amd64 and arm64
 package checks and 100% production line and branch coverage on amd64.
