@@ -1,3 +1,18 @@
+rptadv-portaudio-alsa-adapter (0.2.0~alpha2-1) unstable; urgency=medium
+
+  * Release 0.2.0-alpha.2.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Sat, 19 Sep 2026 09:00:00 -0500
+
+rptadv-portaudio-alsa-adapter (0.2.0~alpha1-1) unstable; urgency=medium
+
+  * Publish ABI 2 with independent receive and transmit worker callbacks.
+  * Remove the adapter capture ring and shared-ring dependency.
+  * Make callback priority elevation best effort and report the inherited
+    scheduling of each worker.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Mon, 14 Sep 2026 12:00:00 -0500
+
 rptadv-portaudio-alsa-adapter (0.1.0~alpha2-1) unstable; urgency=medium
 
   * Publish the tested independent capture/playback callback milestone.

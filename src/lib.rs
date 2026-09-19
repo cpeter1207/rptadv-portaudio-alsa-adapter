@@ -1,21 +1,20 @@
 //! Versioned PortAudio/ALSA adapter with a narrow C-compatible descriptor ABI.
 //!
-//! The callback-side contract is canonical interleaved stereo `f32` PCM.
-//! PortAudio/ALSA performs physical-device conversion below the `paFloat32`
-//! callback, keeping S16/S24 details out of the core.
+//! Separate input-paced receive and DAC-paced transmit callbacks exchange
+//! canonical interleaved stereo `f32` PCM with the radio core. PortAudio/ALSA
+//! performs physical-device conversion below the `paFloat32` callbacks,
+//! keeping S16/S24 details out of the core.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-mod capture_ring;
 mod ffi;
 mod pcm;
 
-use capture_ring::CaptureRing;
 use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs;
-use std::mem::{offset_of, size_of};
+use std::mem::size_of;
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -27,7 +26,7 @@ use ffi::{
 };
 use pcm::{MeterAccumulator, canonical_output_to_device, device_input_to_canonical};
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const AUDIO_OK: c_int = 0;
 const AUDIO_INVALID_ARGUMENT: c_int = -1;
 const AUDIO_NO_MEMORY: c_int = -2;
@@ -36,6 +35,7 @@ const AUDIO_ALSA_ERROR: c_int = -4;
 const AUDIO_UNSUPPORTED: c_int = -5;
 const AUDIO_DEVICE_BUSY: c_int = -6;
 const DEFAULT_DEVICE: i32 = -1;
+const NATIVE_SAMPLE_RATE_HZ: u32 = 48_000;
 const MIXER_NORMALIZED_MAXIMUM: u32 = 999;
 const USB_INTERFACE_PATH_CAPACITY: usize = 256;
 const USB_SERIAL_CAPACITY: usize = 256;
@@ -46,22 +46,28 @@ const CM119_MIXER_PATH_SWITCH: u32 = 1 << 1;
 const CM119_RX_BOOST_ELEMENT: &[u8] = b"Auto Gain Control";
 const USB_SELECTION_EXACT: u32 = 0;
 const USB_SELECTION_AUTOMATIC_LOWEST_ALSA_CARD: u32 = 1;
+const DESIRED_FIFO_PRIORITY: c_int = 99;
+const SCHEDULING_UNKNOWN: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.portaudio-alsa-audio\0";
 
-type NativeTick = Option<unsafe extern "C" fn(*mut c_void, *const f32, *mut f32, u32) -> i32>;
+type ReceiveWorker = Option<unsafe extern "C" fn(*mut c_void, *const f32, u32) -> i32>;
+type TransmitWorker = Option<unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32>;
 
 #[repr(C)]
 struct StreamConfig {
     struct_size: u32,
     abi_version: u32,
     native_sample_rate_hz: u32,
-    maximum_frame_count: u32,
+    maximum_receive_frame_count: u32,
+    maximum_transmit_frame_count: u32,
     input_device_index: i32,
     output_device_index: i32,
     input_device_channels: u32,
     output_device_channels: u32,
-    native_tick: NativeTick,
-    native_tick_context: *mut c_void,
+    receive_worker: ReceiveWorker,
+    receive_worker_context: *mut c_void,
+    transmit_worker: TransmitWorker,
+    transmit_worker_context: *mut c_void,
 }
 
 #[repr(C)]
@@ -72,15 +78,10 @@ struct StreamStats {
     callback_count: u64,
     callback_frame_count: u64,
     oversized_callback_count: u64,
-    native_tick_failure_count: u64,
+    worker_failure_count: u64,
     input_overflow_count: u64,
     output_underflow_count: u64,
     device_error_count: u64,
-    input_queue_capacity_frames: u64,
-    input_queue_occupancy_frames: u64,
-    output_queue_capacity_frames: u64,
-    output_queue_occupancy_frames: u64,
-    output_queue_dropped_frame_count: u64,
     input_clip_sample_count: u64,
     output_clip_sample_count: u64,
     input_peak: f32,
@@ -88,7 +89,7 @@ struct StreamStats {
     output_peak: f32,
     output_rms: f32,
     last_portaudio_error: i32,
-    /// Initialize the original C ABI's trailing padding before a bounded byte copy.
+    /// Initialize C ABI alignment padding before a bounded byte copy.
     alignment_padding: u32,
     callback_last_duration_ns: u64,
     callback_max_duration_ns: u64,
@@ -100,17 +101,18 @@ struct StreamStats {
     last_output_xrun_monotonic_ns: u64,
     callback_clock_error_count: u64,
     capture_callback_count: u64,
-    capture_ring_target_frames: u64,
-    capture_ring_ratio_correction_ppm: i64,
-    capture_ring_missing_frames: u64,
-    capture_ring_dropped_frames: u64,
-    capture_startup_wait_frames: u64,
+    capture_scheduling_policy: i32,
+    capture_scheduling_priority: i32,
+    capture_scheduling_limited: u32,
+    playback_scheduling_policy: i32,
+    playback_scheduling_priority: i32,
+    playback_scheduling_limited: u32,
 }
 
-/// Original ABI-1 snapshot size; trailing diagnostics never overwrite old callers.
-const STREAM_STATS_V1_SIZE: usize = offset_of!(StreamStats, callback_last_duration_ns);
-/// Timing-only ABI-1 callers predate the independent capture diagnostics.
-const STREAM_STATS_TIMING_SIZE: usize = offset_of!(StreamStats, capture_callback_count);
+/// Size published by the original ABI-2 statistics structure.
+const STREAM_STATS_ABI_TWO_PREFIX_SIZE: u32 =
+    std::mem::offset_of!(StreamStats, capture_scheduling_policy) as u32;
+
 /// Ignore ordinary sub-millisecond callback arrival jitter in the late-start count.
 const CALLBACK_LATE_TOLERANCE_NS: u64 = 1_000_000;
 
@@ -268,13 +270,16 @@ unsafe impl Sync for AdapterDescriptor {}
 #[derive(Clone, Copy)]
 struct ValidatedStreamConfig {
     sample_rate_hz: u32,
-    maximum_frame_count: usize,
+    maximum_receive_frame_count: usize,
+    maximum_transmit_frame_count: usize,
     input_device_index: i32,
     output_device_index: i32,
     input_channels: usize,
     output_channels: usize,
-    native_tick: unsafe extern "C" fn(*mut c_void, *const f32, *mut f32, u32) -> i32,
-    native_tick_context: *mut c_void,
+    receive_worker: unsafe extern "C" fn(*mut c_void, *const f32, u32) -> i32,
+    receive_worker_context: *mut c_void,
+    transmit_worker: unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32,
+    transmit_worker_context: *mut c_void,
 }
 
 impl ValidatedStreamConfig {
@@ -286,8 +291,9 @@ impl ValidatedStreamConfig {
         let config = unsafe { &*config };
         if config.struct_size < size_of::<StreamConfig>() as u32
             || config.abi_version != ABI_VERSION
-            || config.native_sample_rate_hz == 0
-            || config.maximum_frame_count == 0
+            || config.native_sample_rate_hz != NATIVE_SAMPLE_RATE_HZ
+            || config.maximum_receive_frame_count == 0
+            || config.maximum_transmit_frame_count == 0
             || !matches!(config.input_device_channels, 1 | 2)
             || !matches!(config.output_device_channels, 1 | 2)
             || config.input_device_index < DEFAULT_DEVICE
@@ -296,16 +302,20 @@ impl ValidatedStreamConfig {
             return Err(AUDIO_INVALID_ARGUMENT);
         }
 
-        let native_tick = config.native_tick.ok_or(AUDIO_INVALID_ARGUMENT)?;
+        let receive_worker = config.receive_worker.ok_or(AUDIO_INVALID_ARGUMENT)?;
+        let transmit_worker = config.transmit_worker.ok_or(AUDIO_INVALID_ARGUMENT)?;
         Ok(Self {
             sample_rate_hz: config.native_sample_rate_hz,
-            maximum_frame_count: config.maximum_frame_count as usize,
+            maximum_receive_frame_count: config.maximum_receive_frame_count as usize,
+            maximum_transmit_frame_count: config.maximum_transmit_frame_count as usize,
             input_device_index: config.input_device_index,
             output_device_index: config.output_device_index,
             input_channels: config.input_device_channels as usize,
             output_channels: config.output_device_channels as usize,
-            native_tick,
-            native_tick_context: config.native_tick_context,
+            receive_worker,
+            receive_worker_context: config.receive_worker_context,
+            transmit_worker,
+            transmit_worker_context: config.transmit_worker_context,
         })
     }
 }
@@ -316,7 +326,7 @@ struct SharedStats {
     callback_count: AtomicU64,
     callback_frame_count: AtomicU64,
     oversized_callback_count: AtomicU64,
-    native_tick_failure_count: AtomicU64,
+    worker_failure_count: AtomicU64,
     input_overflow_count: AtomicU64,
     output_underflow_count: AtomicU64,
     device_error_count: AtomicU64,
@@ -337,9 +347,42 @@ struct SharedStats {
     callback_clock_error_count: AtomicU64,
     previous_callback_start_ns: AtomicU64,
     previous_callback_period_ns: AtomicU64,
+    capture_scheduling_policy: AtomicI32,
+    capture_scheduling_priority: AtomicI32,
+    capture_scheduling_limited: AtomicU32,
+    playback_scheduling_policy: AtomicI32,
+    playback_scheduling_priority: AtomicI32,
+    playback_scheduling_limited: AtomicU32,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulingSelection {
+    changed: bool,
+    policy: c_int,
+    priority: c_int,
+    limited: bool,
 }
 
 impl SharedStats {
+    fn record_scheduling(&self, capture: bool, selection: SchedulingSelection) {
+        let (policy, priority, limited) = if capture {
+            (
+                &self.capture_scheduling_policy,
+                &self.capture_scheduling_priority,
+                &self.capture_scheduling_limited,
+            )
+        } else {
+            (
+                &self.playback_scheduling_policy,
+                &self.playback_scheduling_priority,
+                &self.playback_scheduling_limited,
+            )
+        };
+        policy.store(selection.policy, Ordering::Release);
+        priority.store(selection.priority, Ordering::Release);
+        limited.store(u32::from(selection.limited), Ordering::Release);
+    }
+
     fn record_capture_overflow_timestamp(&self, now: u64) {
         if now != 0 {
             self.last_input_xrun_monotonic_ns
@@ -413,16 +456,10 @@ impl SharedStats {
         stats.callback_count = self.callback_count.load(Ordering::Acquire);
         stats.callback_frame_count = self.callback_frame_count.load(Ordering::Acquire);
         stats.oversized_callback_count = self.oversized_callback_count.load(Ordering::Acquire);
-        stats.native_tick_failure_count = self.native_tick_failure_count.load(Ordering::Acquire);
+        stats.worker_failure_count = self.worker_failure_count.load(Ordering::Acquire);
         stats.input_overflow_count = self.input_overflow_count.load(Ordering::Acquire);
         stats.output_underflow_count = self.output_underflow_count.load(Ordering::Acquire);
         stats.device_error_count = self.device_error_count.load(Ordering::Acquire);
-        // Capture queue diagnostics are filled from the shared ring separately.
-        stats.input_queue_capacity_frames = 0;
-        stats.input_queue_occupancy_frames = 0;
-        stats.output_queue_capacity_frames = 0;
-        stats.output_queue_occupancy_frames = 0;
-        stats.output_queue_dropped_frame_count = 0;
         stats.input_clip_sample_count = self.input_clip_sample_count.load(Ordering::Acquire);
         stats.output_clip_sample_count = self.output_clip_sample_count.load(Ordering::Acquire);
         stats.input_peak = f32::from_bits(self.input_peak_bits.load(Ordering::Acquire));
@@ -444,6 +481,15 @@ impl SharedStats {
             self.last_output_xrun_monotonic_ns.load(Ordering::Acquire);
         stats.callback_clock_error_count = self.callback_clock_error_count.load(Ordering::Acquire);
         stats.capture_callback_count = self.capture_callback_count.load(Ordering::Acquire);
+        stats.capture_scheduling_policy = self.capture_scheduling_policy.load(Ordering::Acquire);
+        stats.capture_scheduling_priority =
+            self.capture_scheduling_priority.load(Ordering::Acquire);
+        stats.capture_scheduling_limited = self.capture_scheduling_limited.load(Ordering::Acquire);
+        stats.playback_scheduling_policy = self.playback_scheduling_policy.load(Ordering::Acquire);
+        stats.playback_scheduling_priority =
+            self.playback_scheduling_priority.load(Ordering::Acquire);
+        stats.playback_scheduling_limited =
+            self.playback_scheduling_limited.load(Ordering::Acquire);
     }
 }
 
@@ -451,75 +497,57 @@ impl SharedStats {
 /// control-plane references to this container from aliasing callback mutation.
 #[repr(C)]
 struct AudioStream {
-    portaudio_stream: *mut PaStream,
+    playback_stream: *mut PaStream,
     capture_stream: *mut PaStream,
     started: [AtomicBool; 2],
     functions: &'static ffi::FunctionTable,
-    config: ValidatedStreamConfig,
     capture: Box<UnsafeCell<CaptureState>>,
     playback: Box<UnsafeCell<PlaybackState>>,
     stats: Arc<SharedStats>,
-    ring: Arc<CaptureRing>,
-    /// Serialize diagnostic observers with quiescent ring reset, never callbacks.
-    ring_control: Mutex<()>,
     device_lease: Option<DeviceLease>,
 }
 
-/// The capture callback is the sole producer and raw hardware meter owner.
+/// Input-paced canonicalization, metering, and receive-worker dispatch.
 struct CaptureState {
-    maximum_frame_count: usize,
-    silence: Box<[f32]>,
+    config: ValidatedStreamConfig,
+    canonical_input: Box<[f32]>,
     input_meter: MeterAccumulator,
     stats: Arc<SharedStats>,
-    ring: Arc<CaptureRing>,
 }
 
-/// Playback is the sole ring consumer and the sole caller of the native tick.
+/// DAC-paced transmit-worker dispatch, canonicalization, and output metering.
 struct PlaybackState {
     config: ValidatedStreamConfig,
-    mono_input: Box<[f32]>,
-    canonical_input: Box<[f32]>,
     canonical_output: Box<[f32]>,
     output_meter: MeterAccumulator,
     stats: Arc<SharedStats>,
-    ring: Arc<CaptureRing>,
 }
 
 impl AudioStream {
-    fn new(
-        functions: &'static ffi::FunctionTable,
-        config: ValidatedStreamConfig,
-    ) -> Result<Self, c_int> {
-        let sample_count = config.maximum_frame_count * pcm::CANONICAL_CHANNELS;
+    fn new(functions: &'static ffi::FunctionTable, config: ValidatedStreamConfig) -> Self {
+        let capture_sample_count = config.maximum_receive_frame_count * pcm::CANONICAL_CHANNELS;
+        let playback_sample_count = config.maximum_transmit_frame_count * pcm::CANONICAL_CHANNELS;
         let stats = Arc::new(SharedStats::default());
-        let ring = Arc::new(CaptureRing::new(config.maximum_frame_count)?);
-        Ok(Self {
-            portaudio_stream: ptr::null_mut(),
+        Self {
+            playback_stream: ptr::null_mut(),
             capture_stream: ptr::null_mut(),
             started: [AtomicBool::new(false), AtomicBool::new(false)],
             functions,
-            config,
             capture: Box::new(UnsafeCell::new(CaptureState {
-                maximum_frame_count: config.maximum_frame_count,
-                silence: vec![0.0; config.maximum_frame_count].into_boxed_slice(),
+                config,
+                canonical_input: vec![0.0; capture_sample_count].into_boxed_slice(),
                 input_meter: MeterAccumulator::default(),
                 stats: Arc::clone(&stats),
-                ring: Arc::clone(&ring),
             })),
             playback: Box::new(UnsafeCell::new(PlaybackState {
                 config,
-                mono_input: vec![0.0; config.maximum_frame_count].into_boxed_slice(),
-                canonical_input: vec![0.0; sample_count].into_boxed_slice(),
-                canonical_output: vec![0.0; sample_count].into_boxed_slice(),
+                canonical_output: vec![0.0; playback_sample_count].into_boxed_slice(),
                 output_meter: MeterAccumulator::default(),
                 stats: Arc::clone(&stats),
-                ring: Arc::clone(&ring),
             })),
             stats,
-            ring,
-            ring_control: Mutex::new(()),
             device_lease: None,
-        })
+        }
     }
 
     fn release_device_lease(&mut self) {
@@ -530,7 +558,7 @@ impl AudioStream {
     /// joins the corresponding callback before its context can be reused.
     fn stop_endpoints(&self) -> c_int {
         let mut status = AUDIO_OK;
-        for (index, handle) in [self.portaudio_stream, self.capture_stream]
+        for (index, handle) in [self.playback_stream, self.capture_stream]
             .into_iter()
             .enumerate()
         {
@@ -592,19 +620,39 @@ impl CaptureState {
             self.stats
                 .record_capture_overflow_timestamp(ffi::monotonic_ns());
         }
+        if frame_count > self.config.maximum_receive_frame_count {
+            self.stats
+                .oversized_callback_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let mut offset = 0;
         while offset < frame_count {
-            let frames = (frame_count - offset).min(self.maximum_frame_count);
-            let samples = if input.is_null() {
-                &self.silence[..frames]
+            let frames = (frame_count - offset).min(self.config.maximum_receive_frame_count);
+            let physical_samples = if input.is_null() {
+                None
             } else {
-                unsafe { std::slice::from_raw_parts(input.add(offset), frames) }
+                Some(unsafe {
+                    std::slice::from_raw_parts(
+                        input.add(offset * self.config.input_channels),
+                        frames * self.config.input_channels,
+                    )
+                })
             };
-            self.input_meter.observe(samples);
-            // This context is the only producer for the lifetime of this ring.
-            if unsafe { self.ring.push(samples) }.is_err() {
+            let canonical = &mut self.canonical_input[..frames * pcm::CANONICAL_CHANNELS];
+            device_input_to_canonical(physical_samples, self.config.input_channels, canonical);
+            self.input_meter.observe(
+                physical_samples.unwrap_or(&canonical[..frames * self.config.input_channels]),
+            );
+            if unsafe {
+                (self.config.receive_worker)(
+                    self.config.receive_worker_context,
+                    canonical.as_ptr(),
+                    frames as u32,
+                )
+            } != 0
+            {
                 self.stats
-                    .device_error_count
+                    .worker_failure_count
                     .fetch_add(1, Ordering::Relaxed);
                 self.publish_meter();
                 return ffi::PA_ABORT;
@@ -629,21 +677,16 @@ impl PlaybackState {
             .store(self.output_meter.clip_sample_count(), Ordering::Release);
     }
 
-    /// Split host blocks at the prepared maximum. Input production is supplied
-    /// separately so the native tick remains one bounded render path.
-    unsafe fn render_callback<F>(
+    /// Split host blocks at the prepared maximum and fill every device frame.
+    unsafe fn process_callback(
         &mut self,
         output: *mut f32,
         frame_count: usize,
         flags: PaStreamCallbackFlags,
-        mut fill_input: F,
-    ) -> c_int
-    where
-        F: FnMut(&mut [f32], &mut [f32]) -> Result<(), c_int>,
-    {
+    ) -> c_int {
         if output.is_null() {
             self.stats
-                .native_tick_failure_count
+                .worker_failure_count
                 .fetch_add(1, Ordering::Relaxed);
             return ffi::PA_ABORT;
         }
@@ -660,36 +703,27 @@ impl PlaybackState {
         self.stats
             .callback_frame_count
             .fetch_add(frame_count as u64, Ordering::Relaxed);
-        if frame_count > self.config.maximum_frame_count {
+        if frame_count > self.config.maximum_transmit_frame_count {
             self.stats
                 .oversized_callback_count
                 .fetch_add(1, Ordering::Relaxed);
         }
         let mut offset = 0;
         while offset < frame_count {
-            let frames = (frame_count - offset).min(self.config.maximum_frame_count);
+            let frames = (frame_count - offset).min(self.config.maximum_transmit_frame_count);
             let samples = frames * pcm::CANONICAL_CHANNELS;
-            let canonical_input = &mut self.canonical_input[..samples];
             let canonical_output = &mut self.canonical_output[..samples];
-            if fill_input(&mut self.mono_input[..frames], canonical_input).is_err() {
-                self.stats
-                    .device_error_count
-                    .fetch_add(1, Ordering::Relaxed);
-                self.publish_meter();
-                return ffi::PA_ABORT;
-            }
             canonical_output.fill(0.0);
-            let result = unsafe {
-                (self.config.native_tick)(
-                    self.config.native_tick_context,
-                    canonical_input.as_ptr(),
+            if unsafe {
+                (self.config.transmit_worker)(
+                    self.config.transmit_worker_context,
                     canonical_output.as_mut_ptr(),
                     frames as u32,
                 )
-            };
-            if result != 0 {
+            } != 0
+            {
                 self.stats
-                    .native_tick_failure_count
+                    .worker_failure_count
                     .fetch_add(1, Ordering::Relaxed);
                 self.publish_meter();
                 return ffi::PA_ABORT;
@@ -706,24 +740,6 @@ impl PlaybackState {
         }
         self.publish_meter();
         ffi::PA_CONTINUE
-    }
-
-    unsafe fn process_callback(
-        &mut self,
-        output: *mut f32,
-        frame_count: usize,
-        flags: PaStreamCallbackFlags,
-    ) -> c_int {
-        // Borrow the separately allocated ring, not this mutable callback state.
-        // Its lifetime covers this call; playback is its only consumer.
-        let ring = Arc::as_ptr(&self.ring);
-        unsafe {
-            self.render_callback(output, frame_count, flags, |mono, canonical| {
-                (*ring).pull(mono)?;
-                device_input_to_canonical(Some(mono), 1, canonical);
-                Ok(())
-            })
-        }
     }
 }
 
@@ -745,7 +761,7 @@ unsafe extern "C" fn capture_callback(
     }
 }
 
-unsafe extern "C" fn portaudio_callback(
+unsafe extern "C" fn playback_callback(
     _input: *const c_void,
     output: *mut c_void,
     frame_count: std::ffi::c_ulong,
@@ -1050,11 +1066,6 @@ fn stream_create_with_functions(
         Ok(config) => config,
         Err(error) => return error,
     };
-    // This node-only experiment uses the released mono clock-recovery ring.
-    // Never reinterpret interleaved stereo as a mono sample stream.
-    if config.input_channels != 1 || config.sample_rate_hz != 48_000 {
-        return AUDIO_UNSUPPORTED;
-    }
     if let Err(error) = portaudio_acquire(functions) {
         return error;
     }
@@ -1089,14 +1100,7 @@ fn stream_create_with_functions(
             return error;
         }
     };
-    let mut boxed_stream = match AudioStream::new(functions, config) {
-        Ok(stream) => Box::new(stream),
-        Err(error) => {
-            drop(device_lease);
-            portaudio_release(functions);
-            return error;
-        }
-    };
+    let mut boxed_stream = Box::new(AudioStream::new(functions, config));
     boxed_stream.device_lease = Some(device_lease);
     let result = unsafe {
         (functions.portaudio.open_stream)(
@@ -1104,7 +1108,7 @@ fn stream_create_with_functions(
             &input_parameters,
             ptr::null(),
             f64::from(config.sample_rate_hz),
-            config.maximum_frame_count as std::ffi::c_ulong,
+            config.maximum_receive_frame_count as std::ffi::c_ulong,
             0,
             Some(capture_callback),
             boxed_stream.capture.get().cast::<c_void>(),
@@ -1118,13 +1122,13 @@ fn stream_create_with_functions(
     }
     let result = unsafe {
         (functions.portaudio.open_stream)(
-            &mut boxed_stream.portaudio_stream,
+            &mut boxed_stream.playback_stream,
             ptr::null(),
             &output_parameters,
             f64::from(config.sample_rate_hz),
-            config.maximum_frame_count as std::ffi::c_ulong,
+            config.maximum_transmit_frame_count as std::ffi::c_ulong,
             0,
-            Some(portaudio_callback),
+            Some(playback_callback),
             boxed_stream.playback.get().cast::<c_void>(),
         )
     };
@@ -1152,12 +1156,65 @@ extern "C" fn stream_create(config: *const StreamConfig, stream: *mut *mut Audio
     stream_create_with_functions(&ffi::PRODUCTION_FUNCTIONS, config, stream)
 }
 
+/// Select the highest available FIFO priority without lowering an inherited
+/// real-time priority. Failure to elevate is a reported limitation, not an
+/// audio-device error.
+fn select_scheduling(
+    scheduling: &ffi::SchedulingFunctions,
+    thread: ffi::Pthread,
+    policy: c_int,
+    priority: c_int,
+) -> SchedulingSelection {
+    let maximum = unsafe { (scheduling.priority_max)(ffi::SCHED_FIFO) };
+    if maximum < 1 {
+        return SchedulingSelection {
+            changed: false,
+            policy,
+            priority,
+            limited: true,
+        };
+    }
+    let desired = maximum.min(DESIRED_FIFO_PRIORITY);
+    if policy == ffi::SCHED_FIFO && priority >= desired {
+        return SchedulingSelection {
+            changed: false,
+            policy,
+            priority,
+            limited: priority < DESIRED_FIFO_PRIORITY,
+        };
+    }
+    let minimum = if policy == ffi::SCHED_FIFO {
+        priority.saturating_add(1).max(1)
+    } else {
+        1
+    };
+    for candidate in (minimum..=desired).rev() {
+        let parameter = ffi::SchedParam {
+            sched_priority: candidate,
+        };
+        if unsafe { (scheduling.set)(thread, ffi::SCHED_FIFO, &parameter) } == 0 {
+            return SchedulingSelection {
+                changed: true,
+                policy: ffi::SCHED_FIFO,
+                priority: candidate,
+                limited: candidate < DESIRED_FIFO_PRIORITY,
+            };
+        }
+    }
+    SchedulingSelection {
+        changed: false,
+        policy,
+        priority,
+        limited: true,
+    }
+}
+
 extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     let Some(stream) = NonNull::new(stream) else {
         return AUDIO_INVALID_ARGUMENT;
     };
     let stream = unsafe { stream.as_ref() };
-    let active = unsafe { (stream.functions.portaudio.is_stream_active)(stream.portaudio_stream) };
+    let active = unsafe { (stream.functions.portaudio.is_stream_active)(stream.playback_stream) };
     let capture_active =
         unsafe { (stream.functions.portaudio.is_stream_active)(stream.capture_stream) };
     if active < 0 || capture_active < 0 {
@@ -1172,41 +1229,23 @@ extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     if stream.stop_endpoints() != AUDIO_OK {
         return AUDIO_PORTAUDIO_ERROR;
     }
-    // Both endpoints are quiescent; prevent a diagnostic observer from using
-    // the old released handle while resetting the capture clock boundary.
-    let Ok(_ring_guard) = stream.ring_control.lock() else {
-        return AUDIO_PORTAUDIO_ERROR;
-    };
-    if unsafe { stream.ring.reset() }.is_err() {
-        stream
-            .stats
-            .device_error_count
-            .fetch_add(1, Ordering::Relaxed);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
     // PortAudio 19.6 ALSA's RT helper requests FIFO priority 1, not the highest
     // priority. Its default callback thread inherits the starter's scheduling.
     // Elevate only this lifecycle call, then restore the caller on every path.
     let scheduling = &stream.functions.scheduling;
     let thread = unsafe { (scheduling.thread_self)() };
-    let mut policy = 0;
+    let mut policy = SCHEDULING_UNKNOWN;
     let mut saved = ffi::SchedParam::default();
-    if unsafe { (scheduling.get)(thread, &mut policy, &mut saved) } != 0 {
-        stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
-    let priority = unsafe { (scheduling.priority_max)(ffi::SCHED_FIFO) };
-    if priority < 1 {
-        stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
-    let highest = ffi::SchedParam {
-        sched_priority: priority,
+    let selection = if unsafe { (scheduling.get)(thread, &mut policy, &mut saved) } == 0 {
+        select_scheduling(scheduling, thread, policy, saved.sched_priority)
+    } else {
+        SchedulingSelection {
+            changed: false,
+            policy: SCHEDULING_UNKNOWN,
+            priority: SCHEDULING_UNKNOWN,
+            limited: true,
+        }
     };
-    if unsafe { (scheduling.set)(thread, ffi::SCHED_FIFO, &highest) } != 0 {
-        stream.stats.record_portaudio_error(ffi::PA_INTERNAL_ERROR);
-        return AUDIO_PORTAUDIO_ERROR;
-    }
     // A stopped interval is not a scheduling delay on the next callback.
     stream
         .stats
@@ -1219,14 +1258,20 @@ extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     let mut result = unsafe { (stream.functions.portaudio.start_stream)(stream.capture_stream) };
     if result == ffi::PA_NO_ERROR {
         stream.started[1].store(true, Ordering::Relaxed);
-        result = unsafe { (stream.functions.portaudio.start_stream)(stream.portaudio_stream) };
+        stream.stats.record_scheduling(true, selection);
+        result = unsafe { (stream.functions.portaudio.start_stream)(stream.playback_stream) };
         if result == ffi::PA_NO_ERROR {
             stream.started[0].store(true, Ordering::Relaxed);
+            stream.stats.record_scheduling(false, selection);
         }
     }
-    let restore = unsafe { (scheduling.set)(thread, policy, &saved) };
+    let restore = if selection.changed {
+        unsafe { (scheduling.set)(thread, policy, &saved) }
+    } else {
+        0
+    };
     if result != ffi::PA_NO_ERROR || restore != 0 {
-        for (index, handle) in [stream.portaudio_stream, stream.capture_stream]
+        for (index, handle) in [stream.playback_stream, stream.capture_stream]
             .into_iter()
             .enumerate()
         {
@@ -1267,13 +1312,9 @@ extern "C" fn stream_get_stats(stream: *const AudioStream, stats: *mut StreamSta
     let Some(stats) = NonNull::new(stats) else {
         return AUDIO_INVALID_ARGUMENT;
     };
-    // Read only the header until the caller's allocation size is known. Old
-    // ABI-1 consumers own a smaller object, so never form a full-size reference.
+    // Read only the header until the caller's allocation size is known.
     let supplied_size = unsafe { ptr::addr_of!((*stats.as_ptr()).struct_size).read() };
-    if supplied_size != STREAM_STATS_V1_SIZE as u32
-        && supplied_size != STREAM_STATS_TIMING_SIZE as u32
-        && supplied_size < size_of::<StreamStats>() as u32
-    {
+    if supplied_size < STREAM_STATS_ABI_TWO_PREFIX_SIZE {
         return AUDIO_INVALID_ARGUMENT;
     }
     let stream = unsafe { stream.as_ref() };
@@ -1282,21 +1323,6 @@ extern "C" fn stream_get_stats(stream: *const AudioStream, stats: *mut StreamSta
         ..StreamStats::default()
     };
     stream.stats.snapshot(&mut snapshot);
-    let Ok(_ring_guard) = stream.ring_control.lock() else {
-        return AUDIO_PORTAUDIO_ERROR;
-    };
-    let ring = match stream.ring.snapshot() {
-        Ok(ring) => ring,
-        Err(error) => return error,
-    };
-    snapshot.input_queue_capacity_frames = ring.capacity_frames;
-    snapshot.input_queue_occupancy_frames = ring.occupancy_frames;
-    snapshot.capture_ring_target_frames = ring.target_frames;
-    snapshot.capture_ring_ratio_correction_ppm = i64::from(ring.ratio_correction_ppm);
-    snapshot.capture_ring_missing_frames = ring.shortfall_frames;
-    snapshot.capture_ring_dropped_frames = ring.dropped_frames;
-    snapshot.capture_startup_wait_frames = ring.startup_silence_frames;
-    snapshot.device_error_count += ring.adapter_error_count;
     unsafe {
         ptr::copy_nonoverlapping(
             (&snapshot as *const StreamStats).cast::<u8>(),
@@ -1326,7 +1352,7 @@ extern "C" fn stream_get_timing(stream: *const AudioStream, timing: *mut StreamT
     }
 
     let stream = unsafe { stream.as_ref() };
-    let info = unsafe { (stream.functions.portaudio.get_stream_info)(stream.portaudio_stream) };
+    let info = unsafe { (stream.functions.portaudio.get_stream_info)(stream.playback_stream) };
     let capture_info =
         unsafe { (stream.functions.portaudio.get_stream_info)(stream.capture_stream) };
     let Some(info) = (unsafe { info.as_ref() }) else {
@@ -1368,7 +1394,7 @@ extern "C" fn stream_destroy(stream: *mut AudioStream) {
     let functions = stream.functions;
     stream.stop_endpoints();
     let mut closed = true;
-    for handle in [&mut stream.portaudio_stream, &mut stream.capture_stream] {
+    for handle in [&mut stream.playback_stream, &mut stream.capture_stream] {
         if handle.is_null() {
             continue;
         }
@@ -2905,7 +2931,7 @@ static DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     cm119_mixer_paths_resolve,
 };
 
-/// Return the immutable function table for ABI version one.
+/// Return the immutable function table for ABI version two.
 #[unsafe(no_mangle)]
 pub extern "C" fn rptadv_portaudio_alsa_adapter_descriptor() -> *const AdapterDescriptor {
     &DESCRIPTOR

@@ -3,8 +3,9 @@
  * @brief Stable C ABI for the rpt_advanced PortAudio/ALSA audio adapter.
  *
  * The adapter exposes canonical interleaved, normalized IEEE-754 binary32
- * stereo PCM to its native-tick callback. PortAudio performs conversion between
- * that format and the physical device format below the callback.
+ * stereo PCM to separate input-paced receive and DAC-paced transmit workers.
+ * PortAudio performs conversion between that format and the physical device
+ * format below the callbacks.
  */
 
 #ifndef RPTADV_PORTAUDIO_ALSA_ADAPTER_H
@@ -17,13 +18,19 @@ extern "C" {
 #endif
 
 /** @brief ABI implemented by this adapter descriptor. */
-#define RPTADV_AUDIO_ADAPTER_ABI_VERSION 1U
+#define RPTADV_AUDIO_ADAPTER_ABI_VERSION 2U
 
-/** @brief Number of interleaved canonical PCM channels supplied to a tick. */
+/** @brief Number of interleaved canonical PCM channels supplied to a worker. */
 #define RPTADV_AUDIO_CANONICAL_CHANNELS 2U
+
+/** @brief Fixed native sample rate accepted by ABI 2. */
+#define RPTADV_AUDIO_NATIVE_SAMPLE_RATE_HZ 48000U
 
 /** @brief Select PortAudio's default input or output device. */
 #define RPTADV_AUDIO_DEFAULT_DEVICE (-1)
+
+/** @brief Scheduling policy or priority could not be queried at stream start. */
+#define RPTADV_AUDIO_SCHEDULING_UNKNOWN (-1)
 
 /** @brief Lowest portable normalized ALSA mixer setting. */
 #define RPTADV_AUDIO_MIXER_NORMALIZED_MINIMUM 0U
@@ -68,19 +75,32 @@ enum rptadv_audio_result {
 };
 
 /**
- * @brief Bounded native-tick callback implemented by the radio core.
+ * @brief Input-paced receive worker implemented by the radio core.
  *
  * @param context Caller-owned callback context.
  * @param input Canonical interleaved stereo input containing @p frame_count frames.
- * @param output Canonical interleaved stereo output to populate with @p frame_count frames.
  * @param frame_count Number of native PCM time frames in this invocation.
- * @return Zero after producing the complete output block; nonzero aborts the stream.
+ * @return Zero after consuming the complete input block; nonzero aborts capture.
  *
  * The callback runs on PortAudio's real-time thread. It must not allocate,
  * lock, block, log, or perform I/O.
  */
-typedef int32_t (*rptadv_audio_native_tick)(void *context, const float *input,
-					    float *output, uint32_t frame_count);
+typedef int32_t (*rptadv_audio_receive_worker)(void *context, const float *input,
+					       uint32_t frame_count);
+
+/**
+ * @brief DAC-paced transmit worker implemented by the radio core.
+ *
+ * @param context Caller-owned callback context.
+ * @param output Canonical interleaved stereo output to populate completely.
+ * @param frame_count Number of native PCM time frames in this invocation.
+ * @return Zero after producing the complete output block; nonzero aborts playback.
+ *
+ * The callback runs on PortAudio's real-time thread. It must not allocate,
+ * lock, block, log, or perform I/O.
+ */
+typedef int32_t (*rptadv_audio_transmit_worker)(void *context, float *output,
+					uint32_t frame_count);
 
 /**
  * @brief Stream setup selected by the control plane before the device opens.
@@ -90,25 +110,28 @@ typedef int32_t (*rptadv_audio_native_tick)(void *context, const float *input,
  * output device for the stream lifetime, so a conflicting open returns
  * @ref RPTADV_AUDIO_DEVICE_BUSY. Input and output device indexes use
  * @ref RPTADV_AUDIO_DEFAULT_DEVICE for the corresponding PortAudio default.
- * This experimental capture-clock adapter requires mono physical input;
- * corrected mono is duplicated on input and a mono output device
- * receives the average of canonical left and right output. The native callback
- * always receives two interleaved channels.
+ * Mono physical input is duplicated on input and a mono output device receives
+ * the average of canonical left and right output. Both workers always exchange
+ * two interleaved canonical channels.
  *
  * The adapter requests PortAudio's default-low input and output latencies and
- * requests @ref maximum_frame_count frames per buffer. A callback with more
- * than that maximum is split into consecutive native ticks, each containing
- * at least one and at most @ref maximum_frame_count frames.
+ * requests each direction's configured maximum frames per buffer. A host block
+ * larger than its maximum is split into consecutive worker calls containing at
+ * least one frame and no more than that direction's declared maximum.
+ * Receive and transmit workers may run concurrently; their contexts must be
+ * disjoint or safe for concurrent access.
  */
 struct rptadv_audio_stream_config {
 	/** Size of this structure supplied by the caller. */
 	uint32_t struct_size;
 	/** Required descriptor ABI version. */
 	uint32_t abi_version;
-	/** Fixed native sample rate for the lifetime of the stream. */
+	/** Fixed native sample rate; use @ref RPTADV_AUDIO_NATIVE_SAMPLE_RATE_HZ. */
 	uint32_t native_sample_rate_hz;
-	/** Largest callback block that the core has preallocated for. */
-	uint32_t maximum_frame_count;
+	/** Largest receive-worker block that the core has preallocated for. */
+	uint32_t maximum_receive_frame_count;
+	/** Largest transmit-worker block that the core has preallocated for. */
+	uint32_t maximum_transmit_frame_count;
 	/** PortAudio input-device index or @ref RPTADV_AUDIO_DEFAULT_DEVICE. */
 	int32_t input_device_index;
 	/** PortAudio output-device index or @ref RPTADV_AUDIO_DEFAULT_DEVICE. */
@@ -117,10 +140,14 @@ struct rptadv_audio_stream_config {
 	uint32_t input_device_channels;
 	/** Physical output-channel count: one or two. */
 	uint32_t output_device_channels;
-	/** Real-time native-tick callback. */
-	rptadv_audio_native_tick native_tick;
-	/** Opaque context returned unchanged to @ref native_tick. */
-	void *native_tick_context;
+	/** Real-time input-paced receive worker. */
+	rptadv_audio_receive_worker receive_worker;
+	/** Opaque context returned unchanged to @ref receive_worker. */
+	void *receive_worker_context;
+	/** Real-time DAC-paced transmit worker. */
+	rptadv_audio_transmit_worker transmit_worker;
+	/** Opaque context returned unchanged to @ref transmit_worker. */
+	void *transmit_worker_context;
 };
 
 /** @brief Lock-free, best-effort raw audio and callback snapshot. */
@@ -129,30 +156,20 @@ struct rptadv_audio_stream_stats {
 	uint32_t struct_size;
 	/** Descriptor ABI that produced this snapshot. */
 	uint32_t abi_version;
-	/** Number of PortAudio callbacks processed. */
+	/** Number of PortAudio playback callbacks processed. */
 	uint64_t callback_count;
-	/** Number of physical callback frames processed. */
+	/** Number of physical playback frames processed. */
 	uint64_t callback_frame_count;
-	/** Number of host blocks split to honor the configured maximum frame count. */
+	/** Capture or playback host blocks split to honor their declared maximum. */
 	uint64_t oversized_callback_count;
-	/** Number of failed native-tick invocations. */
-	uint64_t native_tick_failure_count;
+	/** Number of failed receive- or transmit-worker invocations. */
+	uint64_t worker_failure_count;
 	/** Number of PortAudio input-overflow status notifications. */
 	uint64_t input_overflow_count;
 	/** Number of PortAudio output-underflow status notifications. */
 	uint64_t output_underflow_count;
 	/** Number of PortAudio control-plane errors observed by this stream. */
 	uint64_t device_error_count;
-	/** Preallocated capture clock-recovery ring capacity in frames. */
-	uint64_t input_queue_capacity_frames;
-	/** Capture frames currently readable by the playback-clocked consumer. */
-	uint64_t input_queue_occupancy_frames;
-	/** Adapter playback-queue capacity in frames; zero for this direct path. */
-	uint64_t output_queue_capacity_frames;
-	/** Adapter playback-queue occupancy in frames; zero for this direct path. */
-	uint64_t output_queue_occupancy_frames;
-	/** Adapter playback frames dropped; zero for this direct callback path. */
-	uint64_t output_queue_dropped_frame_count;
 	/** Number of raw input samples at or beyond full scale. */
 	uint64_t input_clip_sample_count;
 	/** Number of output samples at or beyond full scale. */
@@ -167,11 +184,11 @@ struct rptadv_audio_stream_stats {
 	float output_rms;
 	/** Last PortAudio error returned outside the callback, or zero. */
 	int32_t last_portaudio_error;
-	/** Most recent callback wall-clock duration, including preemption, in ns. */
+	/** Most recent playback-callback duration, including preemption, in ns. */
 	uint64_t callback_last_duration_ns;
-	/** Maximum callback duration since stream creation, in ns. */
+	/** Maximum playback-callback duration since stream creation, in ns. */
 	uint64_t callback_max_duration_ns;
-	/** Positive excess over previous block duration between callback starts. */
+	/** Positive excess over the prior playback block between callback starts. */
 	uint64_t callback_last_start_delay_ns;
 	/** Maximum start-gap excess in ns; not a kernel run-queue measurement. */
 	uint64_t callback_max_start_delay_ns;
@@ -185,18 +202,20 @@ struct rptadv_audio_stream_stats {
 	uint64_t last_output_xrun_monotonic_ns;
 	/** Failed monotonic-clock reads; timing is unavailable for those callbacks. */
 	uint64_t callback_clock_error_count;
-	/** Capture-only callbacks; native-tick timing above describes playback. */
+	/** Number of PortAudio capture callbacks processed. */
 	uint64_t capture_callback_count;
-	/** Capture clock-controller target, including one maximum callback block. */
-	uint64_t capture_ring_target_frames;
-	/** Applied capture SRC output/input ratio correction in parts per million. */
-	int64_t capture_ring_ratio_correction_ppm;
-	/** Output frames concealed after capture startup completed. */
-	uint64_t capture_ring_missing_frames;
-	/** Input frames rejected because the capture clock-recovery ring was full. */
-	uint64_t capture_ring_dropped_frames;
-	/** Playback input frames silenced while initially accumulating capture PCM. */
-	uint64_t capture_startup_wait_frames;
+	/** Linux scheduling policy inherited by the capture callback, or -1 if unknown. */
+	int32_t capture_scheduling_policy;
+	/** Linux scheduling priority inherited by capture, or -1 if unknown. */
+	int32_t capture_scheduling_priority;
+	/** Nonzero when capture could not inherit preferred FIFO priority 99. */
+	uint32_t capture_scheduling_limited;
+	/** Linux scheduling policy inherited by the playback callback, or -1 if unknown. */
+	int32_t playback_scheduling_policy;
+	/** Linux scheduling priority inherited by playback, or -1 if unknown. */
+	int32_t playback_scheduling_priority;
+	/** Nonzero when playback could not inherit preferred FIFO priority 99. */
+	uint32_t playback_scheduling_limited;
 };
 
 /**
@@ -450,7 +469,7 @@ struct rptadv_audio_cm119_mixer_paths {
  *
  * All descriptor functions are control-plane operations. The caller must
  * serialize lifecycle and mixer calls for each handle, and must never call
- * them from @ref rptadv_audio_native_tick.
+ * them from @ref rptadv_audio_receive_worker or @ref rptadv_audio_transmit_worker.
  */
 struct rptadv_audio_adapter_descriptor {
 	/** Size of this descriptor. */
@@ -469,12 +488,15 @@ struct rptadv_audio_adapter_descriptor {
 		const struct rptadv_audio_stream_config *config,
 		struct rptadv_audio_stream **stream);
 	/**
-	 * @brief Start callbacks at the highest Linux FIFO priority.
+	 * @brief Start callbacks at the highest permitted Linux FIFO priority.
 	 *
-	 * The caller needs permission for that priority (normally 99). Its original
-	 * scheduling state is restored after PortAudio starts the callback thread.
-	 * Scheduling failure returns a PortAudio error and records an internal error
-	 * in stream statistics; restoration failure aborts a successfully started stream.
+	 * The adapter first tries priority 99 and then lower FIFO priorities. If
+	 * elevation or scheduling metadata is unavailable, callbacks inherit the
+	 * caller's existing scheduling and startup continues. Stream statistics
+	 * report the actual inherited policy/priority, or -1 when querying them was
+	 * impossible, plus a nonfatal limitation flag. A caller scheduling change is
+	 * restored after PortAudio starts both callbacks; restoration failure aborts
+	 * a successfully started stream.
 	 */
 	enum rptadv_audio_result (*stream_start)(struct rptadv_audio_stream *stream);
 	/** Stop callbacks for a running stream. */
@@ -548,7 +570,7 @@ struct rptadv_audio_adapter_descriptor {
 	/**
 	 * @brief Select a USB audio device from a legacy-compatible identifier.
 	 *
-	 * This trailing ABI-1 entry maps a configured topology, serial, legacy
+	 * This entry maps a configured topology, serial, legacy
 	 * native `hw:` identifier, or automatic selection to stable identity and
 	 * exact PortAudio indexes without exposing host inventory details to a
 	 * channel adapter.
@@ -559,7 +581,7 @@ struct rptadv_audio_adapter_descriptor {
 	/**
 	 * @brief Read immutable PortAudio timing after a stream has opened.
 	 *
-	 * This is a control-plane query and must not run from the native callback.
+	 * This is a control-plane query and must not run from an audio callback.
 	 * On failure, every field other than the caller's @ref struct_size is reset
 	 * to zero.  A successful result does not imply that the stream is active.
 	 */
