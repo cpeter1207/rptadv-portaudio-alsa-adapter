@@ -26,6 +26,9 @@ extern "C" {
 /** @brief Fixed native sample rate accepted by ABI 2. */
 #define RPTADV_AUDIO_NATIVE_SAMPLE_RATE_HZ 48000U
 
+/** @brief Largest optional input or output buffer increase in milliseconds. */
+#define RPTADV_AUDIO_MAX_EXTRA_BUFFER_MILLISECONDS 500U
+
 /** @brief Select PortAudio's default input or output device. */
 #define RPTADV_AUDIO_DEFAULT_DEVICE (-1)
 
@@ -115,9 +118,14 @@ typedef int32_t (*rptadv_audio_transmit_worker)(void *context, float *output,
  * two interleaved canonical channels.
  *
  * The adapter requests PortAudio's default-low input and output latencies and
- * requests each direction's configured maximum frames per buffer. A host block
- * larger than its maximum is split into consecutive worker calls containing at
- * least one frame and no more than that direction's declared maximum.
+ * requests each direction's configured maximum frames per buffer. A nonzero
+ * @p extra_output_buffer_milliseconds or @p extra_input_buffer_milliseconds
+ * increases only the matching latency hint, by that amount beyond the
+ * default-low/device-period baseline. Zero retains the default-low request.
+ * These values are host hints, not latency guarantees.
+ * A host block larger than its maximum is split into consecutive worker calls
+ * containing at least one frame and no more than that direction's declared
+ * maximum.
  * Receive and transmit workers may run concurrently; their contexts must be
  * disjoint or safe for concurrent access.
  */
@@ -148,6 +156,10 @@ struct rptadv_audio_stream_config {
 	rptadv_audio_transmit_worker transmit_worker;
 	/** Opaque context returned unchanged to @ref transmit_worker. */
 	void *transmit_worker_context;
+	/** Optional extra PortAudio output-buffer request, in milliseconds (0-500). */
+	uint32_t extra_output_buffer_milliseconds;
+	/** Optional extra PortAudio input-buffer request, in milliseconds (0-500). */
+	uint32_t extra_input_buffer_milliseconds;
 };
 
 /** @brief Lock-free, best-effort raw audio and callback snapshot. */

@@ -46,6 +46,7 @@ const CM119_MIXER_PATH_SWITCH: u32 = 1 << 1;
 const CM119_RX_BOOST_ELEMENT: &[u8] = b"Auto Gain Control";
 const USB_SELECTION_EXACT: u32 = 0;
 const USB_SELECTION_AUTOMATIC_LOWEST_ALSA_CARD: u32 = 1;
+const MAX_EXTRA_BUFFER_MILLISECONDS: u32 = 500;
 const DESIRED_FIFO_PRIORITY: c_int = 99;
 const SCHEDULING_UNKNOWN: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.portaudio-alsa-audio\0";
@@ -68,7 +69,37 @@ struct StreamConfig {
     receive_worker_context: *mut c_void,
     transmit_worker: TransmitWorker,
     transmit_worker_context: *mut c_void,
+    /// Optional tail field; older ABI-2 callers use zero by omitting it.
+    extra_output_buffer_milliseconds: u32,
+    /// Optional capture-buffer cushion; absent from earlier ABI-2 structures.
+    extra_input_buffer_milliseconds: u32,
 }
+
+/// ABI-2 stream-config prefix used by callers built before the optional tail.
+#[repr(C)]
+struct StreamConfigPrefix {
+    struct_size: u32,
+    abi_version: u32,
+    native_sample_rate_hz: u32,
+    maximum_receive_frame_count: u32,
+    maximum_transmit_frame_count: u32,
+    input_device_index: i32,
+    output_device_index: i32,
+    input_device_channels: u32,
+    output_device_channels: u32,
+    receive_worker: ReceiveWorker,
+    receive_worker_context: *mut c_void,
+    transmit_worker: TransmitWorker,
+    transmit_worker_context: *mut c_void,
+}
+
+const STREAM_CONFIG_ABI_TWO_PREFIX_SIZE: u32 =
+    std::mem::offset_of!(StreamConfig, extra_output_buffer_milliseconds) as u32;
+const STREAM_CONFIG_OUTPUT_FIELD_END_SIZE: u32 =
+    (std::mem::offset_of!(StreamConfig, extra_output_buffer_milliseconds) + size_of::<u32>())
+        as u32;
+const STREAM_CONFIG_INPUT_FIELD_END_SIZE: u32 =
+    (std::mem::offset_of!(StreamConfig, extra_input_buffer_milliseconds) + size_of::<u32>()) as u32;
 
 #[repr(C)]
 #[derive(Default)]
@@ -280,6 +311,8 @@ struct ValidatedStreamConfig {
     receive_worker_context: *mut c_void,
     transmit_worker: unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32,
     transmit_worker_context: *mut c_void,
+    extra_output_buffer_milliseconds: u32,
+    extra_input_buffer_milliseconds: u32,
 }
 
 impl ValidatedStreamConfig {
@@ -288,9 +321,29 @@ impl ValidatedStreamConfig {
             return Err(AUDIO_INVALID_ARGUMENT);
         }
 
-        let config = unsafe { &*config };
-        if config.struct_size < size_of::<StreamConfig>() as u32
-            || config.abi_version != ABI_VERSION
+        let supplied_size = unsafe { ptr::addr_of!((*config).struct_size).read() };
+        if supplied_size < STREAM_CONFIG_ABI_TWO_PREFIX_SIZE
+            || (supplied_size > STREAM_CONFIG_ABI_TWO_PREFIX_SIZE
+                && supplied_size < STREAM_CONFIG_OUTPUT_FIELD_END_SIZE)
+            || (supplied_size > STREAM_CONFIG_OUTPUT_FIELD_END_SIZE
+                && supplied_size < STREAM_CONFIG_INPUT_FIELD_END_SIZE)
+        {
+            return Err(AUDIO_INVALID_ARGUMENT);
+        }
+        let extra_output_buffer_milliseconds =
+            if supplied_size >= STREAM_CONFIG_OUTPUT_FIELD_END_SIZE {
+                unsafe { ptr::addr_of!((*config).extra_output_buffer_milliseconds).read() }
+            } else {
+                0
+            };
+        let extra_input_buffer_milliseconds = if supplied_size >= STREAM_CONFIG_INPUT_FIELD_END_SIZE
+        {
+            unsafe { ptr::addr_of!((*config).extra_input_buffer_milliseconds).read() }
+        } else {
+            0
+        };
+        let config = unsafe { &*config.cast::<StreamConfigPrefix>() };
+        if config.abi_version != ABI_VERSION
             || config.native_sample_rate_hz != NATIVE_SAMPLE_RATE_HZ
             || config.maximum_receive_frame_count == 0
             || config.maximum_transmit_frame_count == 0
@@ -298,6 +351,8 @@ impl ValidatedStreamConfig {
             || !matches!(config.output_device_channels, 1 | 2)
             || config.input_device_index < DEFAULT_DEVICE
             || config.output_device_index < DEFAULT_DEVICE
+            || extra_output_buffer_milliseconds > MAX_EXTRA_BUFFER_MILLISECONDS
+            || extra_input_buffer_milliseconds > MAX_EXTRA_BUFFER_MILLISECONDS
         {
             return Err(AUDIO_INVALID_ARGUMENT);
         }
@@ -316,6 +371,8 @@ impl ValidatedStreamConfig {
             receive_worker_context: config.receive_worker_context,
             transmit_worker,
             transmit_worker_context: config.transmit_worker_context,
+            extra_output_buffer_milliseconds,
+            extra_input_buffer_milliseconds,
         })
     }
 }
@@ -940,6 +997,24 @@ fn resolve_device(
     ))
 }
 
+/// Preserve default-low buffering and add only the requested directional cushion.
+///
+/// ALSA derives its host-buffer size from the maximum worker block and this
+/// PortAudio hint. Apply the cushion after the larger of those two baselines.
+fn suggested_latency_seconds(
+    default_low_latency_seconds: f64,
+    maximum_frame_count: usize,
+    sample_rate_hz: u32,
+    extra_buffer_milliseconds: u32,
+) -> f64 {
+    if extra_buffer_milliseconds == 0 {
+        return default_low_latency_seconds;
+    }
+    let callback_period = maximum_frame_count as f64 / f64::from(sample_rate_hz);
+    default_low_latency_seconds.max(callback_period)
+        + f64::from(extra_buffer_milliseconds) / 1_000.0
+}
+
 /// A native ALSA card and PCM device extracted from a PortAudio ALSA name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RawAlsaDevice {
@@ -1069,7 +1144,7 @@ fn stream_create_with_functions(
     if let Err(error) = portaudio_acquire(functions) {
         return error;
     }
-    let (input_device, input_parameters) = match resolve_device(
+    let (input_device, mut input_parameters) = match resolve_device(
         functions,
         config.input_device_index,
         config.input_channels,
@@ -1081,7 +1156,7 @@ fn stream_create_with_functions(
             return error;
         }
     };
-    let (output_device, output_parameters) = match resolve_device(
+    let (output_device, mut output_parameters) = match resolve_device(
         functions,
         config.output_device_index,
         config.output_channels,
@@ -1093,6 +1168,18 @@ fn stream_create_with_functions(
             return error;
         }
     };
+    input_parameters.suggested_latency = suggested_latency_seconds(
+        input_parameters.suggested_latency,
+        config.maximum_receive_frame_count,
+        config.sample_rate_hz,
+        config.extra_input_buffer_milliseconds,
+    );
+    output_parameters.suggested_latency = suggested_latency_seconds(
+        output_parameters.suggested_latency,
+        config.maximum_transmit_frame_count,
+        config.sample_rate_hz,
+        config.extra_output_buffer_milliseconds,
+    );
     let device_lease = match DeviceLease::acquire(input_device, output_device) {
         Ok(device_lease) => device_lease,
         Err(error) => {
