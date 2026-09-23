@@ -187,6 +187,8 @@ fn test_config(
         receive_worker_context: ptr::null_mut(),
         transmit_worker,
         transmit_worker_context: ptr::null_mut(),
+        extra_output_buffer_milliseconds: 0,
+        extra_input_buffer_milliseconds: 0,
     }
 }
 
@@ -1404,6 +1406,68 @@ fn ffi_stream_config() -> StreamConfig {
         receive_worker_context: ptr::null_mut(),
         transmit_worker: Some(silence_output),
         transmit_worker_context: ptr::null_mut(),
+        extra_output_buffer_milliseconds: 0,
+        extra_input_buffer_milliseconds: 0,
+    }
+}
+
+fn legacy_stream_config() -> StreamConfigPrefix {
+    StreamConfigPrefix {
+        struct_size: size_of::<StreamConfigPrefix>() as u32,
+        abi_version: ABI_VERSION,
+        native_sample_rate_hz: 48_000,
+        maximum_receive_frame_count: 960,
+        maximum_transmit_frame_count: 960,
+        input_device_index: DEFAULT_DEVICE,
+        output_device_index: DEFAULT_DEVICE,
+        input_device_channels: 1,
+        output_device_channels: 1,
+        receive_worker: Some(accept_input),
+        receive_worker_context: ptr::null_mut(),
+        transmit_worker: Some(silence_output),
+        transmit_worker_context: ptr::null_mut(),
+    }
+}
+
+#[repr(C)]
+struct BufferedStreamConfig {
+    struct_size: u32,
+    abi_version: u32,
+    native_sample_rate_hz: u32,
+    maximum_receive_frame_count: u32,
+    maximum_transmit_frame_count: u32,
+    input_device_index: i32,
+    output_device_index: i32,
+    input_device_channels: u32,
+    output_device_channels: u32,
+    receive_worker: ReceiveWorker,
+    receive_worker_context: *mut c_void,
+    transmit_worker: TransmitWorker,
+    transmit_worker_context: *mut c_void,
+    extra_output_buffer_milliseconds: u32,
+    extra_input_buffer_milliseconds: u32,
+}
+
+fn buffered_stream_config(
+    extra_input_buffer_milliseconds: u32,
+    extra_output_buffer_milliseconds: u32,
+) -> BufferedStreamConfig {
+    BufferedStreamConfig {
+        struct_size: size_of::<BufferedStreamConfig>() as u32,
+        abi_version: ABI_VERSION,
+        native_sample_rate_hz: 48_000,
+        maximum_receive_frame_count: 960,
+        maximum_transmit_frame_count: 960,
+        input_device_index: DEFAULT_DEVICE,
+        output_device_index: DEFAULT_DEVICE,
+        input_device_channels: 1,
+        output_device_channels: 1,
+        receive_worker: Some(accept_input),
+        receive_worker_context: ptr::null_mut(),
+        transmit_worker: Some(silence_output),
+        transmit_worker_context: ptr::null_mut(),
+        extra_output_buffer_milliseconds,
+        extra_input_buffer_milliseconds,
     }
 }
 
@@ -1584,6 +1648,58 @@ fn validate_stream_config_requires_both_workers() {
 }
 
 #[test]
+fn old_abi_two_stream_config_keeps_default_low_output_latency() {
+    assert_eq!(
+        size_of::<StreamConfigPrefix>() as u32,
+        STREAM_CONFIG_ABI_TWO_PREFIX_SIZE
+    );
+    let config = legacy_stream_config();
+    let validated = unsafe {
+        ValidatedStreamConfig::from_ffi(
+            (&config as *const StreamConfigPrefix).cast::<StreamConfig>(),
+        )
+    }
+    .unwrap();
+
+    assert_eq!(validated.extra_output_buffer_milliseconds, 0);
+    assert_eq!(validated.extra_input_buffer_milliseconds, 0);
+}
+
+#[test]
+fn output_only_abi_two_stream_config_defaults_capture_buffering() {
+    let mut config = buffered_stream_config(0, 20);
+    config.struct_size = STREAM_CONFIG_OUTPUT_FIELD_END_SIZE;
+    let validated = unsafe {
+        ValidatedStreamConfig::from_ffi(
+            (&config as *const BufferedStreamConfig).cast::<StreamConfig>(),
+        )
+    }
+    .unwrap();
+
+    assert_eq!(validated.extra_output_buffer_milliseconds, 20);
+    assert_eq!(validated.extra_input_buffer_milliseconds, 0);
+}
+
+#[test]
+fn partial_optional_stream_config_fields_are_rejected() {
+    for struct_size in [
+        STREAM_CONFIG_ABI_TWO_PREFIX_SIZE + 1,
+        STREAM_CONFIG_OUTPUT_FIELD_END_SIZE + 1,
+    ] {
+        let mut config = buffered_stream_config(0, 0);
+        config.struct_size = struct_size;
+        assert!(matches!(
+            unsafe {
+                ValidatedStreamConfig::from_ffi(
+                    (&config as *const BufferedStreamConfig).cast::<StreamConfig>(),
+                )
+            },
+            Err(AUDIO_INVALID_ARGUMENT)
+        ));
+    }
+}
+
+#[test]
 fn validate_stream_config_rejects_every_incompatible_abi_field() {
     let mut config = ffi_stream_config();
     assert!(matches!(
@@ -1707,6 +1823,78 @@ fn function_table_exercises_f32_stream_lifecycle_without_hardware() {
         assert_eq!(state.close_count, 2);
         assert_eq!(state.terminate_count, 1);
     });
+}
+
+#[test]
+fn stream_adds_extra_output_buffer_without_changing_capture_latency() {
+    let _serial = lock_fake();
+    reset_fake_functions();
+    let config = buffered_stream_config(0, 20);
+    let mut stream = ptr::null_mut();
+
+    assert_eq!(
+        stream_create_with_functions(
+            &TEST_FUNCTIONS,
+            (&config as *const BufferedStreamConfig).cast(),
+            &mut stream,
+        ),
+        AUDIO_OK
+    );
+    FAKE_PORTAUDIO.with(|state| {
+        let state = state.borrow();
+        assert_eq!(state.input_latency, 0.004);
+        assert_eq!(state.output_latency, 0.040);
+    });
+    stream_destroy(stream);
+}
+
+#[test]
+fn stream_adds_extra_input_buffer_without_changing_playback_latency() {
+    let _serial = lock_fake();
+    reset_fake_functions();
+    let config = buffered_stream_config(20, 0);
+    let mut stream = ptr::null_mut();
+
+    assert_eq!(
+        stream_create_with_functions(
+            &TEST_FUNCTIONS,
+            (&config as *const BufferedStreamConfig).cast(),
+            &mut stream,
+        ),
+        AUDIO_OK
+    );
+    FAKE_PORTAUDIO.with(|state| {
+        let state = state.borrow();
+        assert_eq!(state.input_latency, 0.040);
+        assert_eq!(state.output_latency, 0.006);
+    });
+    stream_destroy(stream);
+}
+
+#[test]
+fn stream_config_rejects_excessive_extra_output_buffer() {
+    let config = buffered_stream_config(0, 501);
+    assert!(matches!(
+        unsafe {
+            ValidatedStreamConfig::from_ffi(
+                (&config as *const BufferedStreamConfig).cast::<StreamConfig>(),
+            )
+        },
+        Err(AUDIO_INVALID_ARGUMENT)
+    ));
+}
+
+#[test]
+fn stream_config_rejects_excessive_extra_input_buffer() {
+    let config = buffered_stream_config(501, 0);
+    assert!(matches!(
+        unsafe {
+            ValidatedStreamConfig::from_ffi(
+                (&config as *const BufferedStreamConfig).cast::<StreamConfig>(),
+            )
+        },
+        Err(AUDIO_INVALID_ARGUMENT)
+    ));
 }
 
 #[test]

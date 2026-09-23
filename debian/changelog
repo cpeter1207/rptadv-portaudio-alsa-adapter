@@ -1,3 +1,11 @@
+rptadv-portaudio-alsa-adapter (0.2.0~alpha3-1) unstable; urgency=medium
+
+  * Add optional, independent PortAudio capture and playback buffer requests
+    to ABI 2, retaining default-low buffering for callers using older structure
+    sizes.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Wed, 23 Sep 2026 16:06:00 -0500
+
 rptadv-portaudio-alsa-adapter (0.2.0~alpha2-1) unstable; urgency=medium
 
   * Release 0.2.0-alpha.2.

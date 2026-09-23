@@ -43,6 +43,8 @@ int main(void)
 		.receive_worker_context = NULL,
 		.transmit_worker = noop_transmit,
 		.transmit_worker_context = NULL,
+		.extra_output_buffer_milliseconds = 0,
+		.extra_input_buffer_milliseconds = 0,
 	};
 	struct rptadv_audio_stream_stats stats = {
 		.struct_size = sizeof(stats),
@@ -119,6 +121,8 @@ int main(void)
 	assert(descriptor->cm119_mixer_paths_resolve != NULL);
 	assert(stream_config.receive_worker_context == NULL);
 	assert(stream_config.transmit_worker_context == NULL);
+	assert(stream_config.extra_output_buffer_milliseconds == 0);
+	assert(stream_config.extra_input_buffer_milliseconds == 0);
 	assert(mixer_config.direction == RPTADV_AUDIO_MIXER_CAPTURE);
 	assert(usb_mixer_config.direction == RPTADV_AUDIO_MIXER_CAPTURE);
 	assert(usb_identity.input_device_channels == 1);

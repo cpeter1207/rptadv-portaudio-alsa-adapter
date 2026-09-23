@@ -65,9 +65,13 @@ The adapter then takes a process-wide control-plane lease on each resolved
 PortAudio device index. A second stream that overlaps either physical device
 fails with `RPTADV_AUDIO_DEVICE_BUSY`; the lease is released after stream close
 or an open failure. The lease mutex is never touched by the audio callback.
-The adapter selects each device's default-low PortAudio latency. Capture and
-playback run independently: capture dispatches each input block directly to the
-receive worker, and playback asks the transmit worker to fill each output block.
+The adapter selects each device's default-low PortAudio latency by default.
+Callers may request up to 500 ms of additional capture or playback buffering
+independently; zero preserves default-low behavior. A positive value is added
+to the larger of that device's low-latency request and the declared callback
+period. These are host hints, not latency guarantees. Capture and playback run
+independently: capture dispatches each input block directly to the receive
+worker, and playback asks the transmit worker to fill each output block.
 The owning radio core is responsible for any path that bridges the two device
 clocks. The adapter contains no PCM ring or resampler.
 Both callbacks prefer `SCHED_FIFO` priority 99 on Linux. Stream startup
