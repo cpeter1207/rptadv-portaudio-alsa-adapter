@@ -615,6 +615,13 @@ struct rptadv_audio_adapter_descriptor {
 	enum rptadv_audio_result (*cm119_mixer_paths_resolve)(
 		const char *usb_interface_path,
 		struct rptadv_audio_cm119_mixer_paths *paths);
+	/** Optional complete ABI-two tail: resolve exact raw hw:card[,pcm] ALSA
+	 * audio without USB/HID. Channel counts are one or two. Returned indexes
+	 * carry no USB identity. No default-device fallback. Preserve struct_size
+	 * and clear output on failure. */
+	enum rptadv_audio_result (*alsa_device_resolve)(const char *native_name,
+		uint32_t input_channels, uint32_t output_channels,
+		struct rptadv_audio_usb_device_selection *selection);
 };
 
 /**

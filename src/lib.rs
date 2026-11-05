@@ -292,6 +292,7 @@ pub struct AdapterDescriptor {
     usb_device_select: extern "C" fn(*const UsbDeviceSelector, *mut UsbDeviceMatch) -> c_int,
     stream_get_timing: extern "C" fn(*const AudioStream, *mut StreamTiming) -> c_int,
     cm119_mixer_paths_resolve: extern "C" fn(*const c_char, *mut Cm119MixerPaths) -> c_int,
+    alsa_device_resolve: extern "C" fn(*const c_char, u32, u32, *mut UsbDeviceSelection) -> c_int,
 }
 
 // The descriptor is immutable function and data pointers that remain valid for
@@ -2390,6 +2391,85 @@ fn usb_device_select_with_functions_and_root(
     AUDIO_OK
 }
 
+/// Resolve only an exact raw ALSA endpoint; no USB/HID discovery or default fallback.
+fn alsa_device_resolve_with_functions(
+    functions: &'static ffi::FunctionTable,
+    name: *const c_char,
+    input_channels: u32,
+    output_channels: u32,
+    selection: *mut UsbDeviceSelection,
+) -> c_int {
+    let Some(selection) = NonNull::new(selection) else {
+        return AUDIO_INVALID_ARGUMENT;
+    };
+    // SAFETY: this control call lends a complete aligned output record.
+    let selection = unsafe { &mut *selection.as_ptr() };
+    let size = selection.struct_size;
+    *selection = UsbDeviceSelection {
+        struct_size: size,
+        ..Default::default()
+    };
+    if size < size_of::<UsbDeviceSelection>() as u32
+        || name.is_null()
+        || !matches!(input_channels, 1 | 2)
+        || !matches!(output_channels, 1 | 2)
+    {
+        return AUDIO_INVALID_ARGUMENT;
+    }
+    // SAFETY: the public contract requires a NUL-terminated borrowed selector.
+    let endpoint = unsafe { CStr::from_ptr(name) }
+        .to_str()
+        .map_err(|_| AUDIO_INVALID_ARGUMENT)
+        .and_then(parse_legacy_hw_selector);
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(code) => return code,
+    };
+    if let Err(code) = portaudio_acquire(functions) {
+        return code;
+    }
+    let resolved = (|| {
+        let input = resolve_portaudio_device_for_alsa_endpoint(
+            functions,
+            endpoint.card_index,
+            endpoint.pcm_device,
+            input_channels as usize,
+            true,
+        )?;
+        let output = resolve_portaudio_device_for_alsa_endpoint(
+            functions,
+            endpoint.card_index,
+            endpoint.pcm_device,
+            output_channels as usize,
+            false,
+        )?;
+        Ok((input, output))
+    })();
+    portaudio_release(functions);
+    match resolved {
+        Ok((input_device_index, output_device_index)) => {
+            *selection = UsbDeviceSelection {
+                struct_size: size,
+                abi_version: ABI_VERSION,
+                alsa_card_index: endpoint.card_index,
+                input_device_index,
+                output_device_index,
+            };
+            AUDIO_OK
+        }
+        Err(code) => code,
+    }
+}
+
+extern "C" fn alsa_device_resolve(
+    name: *const c_char,
+    input: u32,
+    output: u32,
+    selection: *mut UsbDeviceSelection,
+) -> c_int {
+    alsa_device_resolve_with_functions(&ffi::PRODUCTION_FUNCTIONS, name, input, output, selection)
+}
+
 extern "C" fn usb_device_select(
     selector: *const UsbDeviceSelector,
     device_match: *mut UsbDeviceMatch,
@@ -3016,6 +3096,7 @@ static DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     usb_device_select,
     stream_get_timing,
     cm119_mixer_paths_resolve,
+    alsa_device_resolve,
 };
 
 /// Return the immutable function table for ABI version two.
