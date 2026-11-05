@@ -1,3 +1,10 @@
+rptadv-portaudio-alsa-adapter (0.2.0~alpha4-1) unstable; urgency=medium
+
+  * Resolve exact raw ALSA audio endpoints without requiring USB identity.
+  * Keep ABI and SONAME 2; append an optional complete descriptor tail.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 05 Nov 2026 18:00:00 -0600
+
 rptadv-portaudio-alsa-adapter (0.2.0~alpha3-1) unstable; urgency=medium
 
   * Add optional, independent PortAudio capture and playback buffer requests

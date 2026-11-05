@@ -28,7 +28,7 @@ S16 Asterisk and CM119 boundaries.
 
 ## Status
 
-Version `0.2.0-alpha.2` packages separate input-paced receive and DAC-paced
+Version `0.2.0-alpha.4` packages separate input-paced receive and DAC-paced
 transmit workers as a Rust `cdylib` with ABI major 2. Release publication requires
 the full pull-request quality gate, including native Debian 13 amd64 and arm64
 package checks and 100% production line and branch coverage on amd64.
@@ -61,6 +61,11 @@ devices without a serial return an empty serial identity. It rejects missing,
 ambiguous, plugin, and non-ALSA-name matches rather
 than guessing from a transient card or PortAudio index. A caller resolves the
 selection immediately before opening a stream and supplies those exact indexes.
+For a radio with its own Linux sound device, `alsa_device_resolve` selects an
+exact raw `hw:card,device` endpoint without a USB or HID identity. The name must
+resolve to one ALSA input and output device. Plugin and default-device names
+are rejected.
+
 The adapter then takes a process-wide control-plane lease on each resolved
 PortAudio device index. A second stream that overlaps either physical device
 fails with `RPTADV_AUDIO_DEVICE_BUSY`; the lease is released after stream close
