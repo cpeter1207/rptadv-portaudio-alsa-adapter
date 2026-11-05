@@ -2140,6 +2140,7 @@ fn generic_alsa_selection_needs_no_usb_identity_or_default_device() {
         (c"hw:99,0", 1, 2, AUDIO_UNSUPPORTED),
         (c"hw:7,1", 1, 2, AUDIO_UNSUPPORTED),
         (c"hw:7,0", 0, 2, AUDIO_INVALID_ARGUMENT),
+        (c"hw:7,0", 1, 0, AUDIO_INVALID_ARGUMENT),
     ] {
         assert_eq!(
             alsa_device_resolve_with_functions(
@@ -2167,10 +2168,63 @@ fn generic_alsa_selection_needs_no_usb_identity_or_default_device() {
         ),
         AUDIO_INVALID_ARGUMENT
     );
+    selection.struct_size = 0;
+    assert_eq!(
+        alsa_device_resolve_with_functions(
+            &TEST_FUNCTIONS,
+            c"hw:7,0".as_ptr(),
+            1,
+            2,
+            &mut selection
+        ),
+        AUDIO_INVALID_ARGUMENT
+    );
+    selection.struct_size = size_of::<UsbDeviceSelection>() as u32;
+    let invalid_name = [0xff_u8, 0];
+    assert_eq!(
+        alsa_device_resolve_with_functions(
+            &TEST_FUNCTIONS,
+            invalid_name.as_ptr().cast(),
+            1,
+            2,
+            &mut selection
+        ),
+        AUDIO_INVALID_ARGUMENT
+    );
+    FAKE_DEVICE_INFO.with(|info| info.borrow_mut().max_output_channels = 0);
+    assert_eq!(
+        alsa_device_resolve_with_functions(
+            &TEST_FUNCTIONS,
+            c"hw:7,0".as_ptr(),
+            1,
+            2,
+            &mut selection
+        ),
+        AUDIO_UNSUPPORTED
+    );
+    assert_eq!(selection.abi_version, 0);
     FAKE_PORTAUDIO.with(|state| {
         let state = state.borrow();
         assert_eq!(state.initialize_count, state.terminate_count);
     });
+    reset_fake_functions();
+    FAKE_PORTAUDIO.with(|state| state.borrow_mut().initialize_result = -90);
+    assert_eq!(
+        alsa_device_resolve_with_functions(
+            &TEST_FUNCTIONS,
+            c"hw:7,0".as_ptr(),
+            1,
+            2,
+            &mut selection
+        ),
+        AUDIO_PORTAUDIO_ERROR
+    );
+    assert_eq!(selection.abi_version, 0);
+    assert_eq!(
+        (DESCRIPTOR.alsa_device_resolve)(ptr::null(), 1, 2, ptr::null_mut()),
+        AUDIO_INVALID_ARGUMENT
+    );
+    reset_fake_functions();
 }
 
 #[test]
