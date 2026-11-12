@@ -4,9 +4,40 @@
  */
 
 #include <assert.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "rptadv_portaudio_alsa_adapter/rptadv_portaudio_alsa_adapter.h"
+
+/* The alpha4 descriptor has its two integers, capability pointer and 23
+ * function slots on both supported Debian 64-bit architectures. */
+struct alpha4_descriptor_prefix {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	const char *capability_name;
+	void (*operations[23])(void);
+};
+
+_Static_assert(offsetof(struct rptadv_audio_adapter_descriptor, stream_create) ==
+	       offsetof(struct alpha4_descriptor_prefix, operations),
+	       "original operation prefix moved");
+_Static_assert(offsetof(struct rptadv_audio_adapter_descriptor, alsa_device_resolve) ==
+	       offsetof(struct alpha4_descriptor_prefix, operations[22]),
+	       "alpha4 final operation moved");
+_Static_assert(offsetof(struct rptadv_audio_adapter_descriptor,
+	       stream_create_with_output_timing) == sizeof(struct alpha4_descriptor_prefix),
+	       "timed constructor must append the published descriptor");
+
+_Static_assert(sizeof(struct rptadv_audio_output_timing) == 48,
+	       "timing record size must match the Rust repr(C) contract");
+_Static_assert(offsetof(struct rptadv_audio_output_timing, callback_monotonic_ns) == 16,
+	       "monotonic observation offset changed");
+_Static_assert(offsetof(struct rptadv_audio_output_timing, stream_current_time_seconds) == 24,
+	       "backend current-time offset changed");
+_Static_assert(offsetof(struct rptadv_audio_output_timing, first_frame_dac_time_seconds) == 32,
+	       "DAC estimate offset changed");
+_Static_assert(offsetof(struct rptadv_audio_output_timing, maximum_error_ns) == 40,
+	       "unknown-error offset changed");
 
 static int32_t noop_receive(void *context, const float *input,
 			    uint32_t frame_count)
@@ -98,6 +129,9 @@ int main(void)
 	assert(descriptor->struct_size == sizeof(*descriptor));
 	assert(strcmp(descriptor->capability_name, "rptadv.portaudio-alsa-audio") == 0);
 	assert(descriptor->stream_create != NULL);
+	assert(descriptor->stream_create_with_output_timing != NULL);
+	assert(descriptor->stream_create_with_output_timing(&stream_config, NULL, NULL) ==
+	       RPTADV_AUDIO_INVALID_ARGUMENT);
 	assert(descriptor->stream_start != NULL);
 	assert(descriptor->stream_stop != NULL);
 	assert(descriptor->stream_get_stats != NULL);

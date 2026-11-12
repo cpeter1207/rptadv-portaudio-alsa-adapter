@@ -9,6 +9,7 @@
 
 mod ffi;
 mod pcm;
+mod timing;
 
 use std::cell::UnsafeCell;
 use std::collections::HashSet;
@@ -25,6 +26,8 @@ use ffi::{
     SndMixerElem,
 };
 use pcm::{MeterAccumulator, canonical_output_to_device, device_input_to_canonical};
+
+use timing::{OutputTiming, OutputTimingHistory};
 
 const ABI_VERSION: u32 = 2;
 const AUDIO_OK: c_int = 0;
@@ -53,6 +56,15 @@ const CAPABILITY_NAME: &[u8] = b"rptadv.portaudio-alsa-audio\0";
 
 type ReceiveWorker = Option<unsafe extern "C" fn(*mut c_void, *const f32, u32) -> i32>;
 type TransmitWorker = Option<unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32>;
+type TimedTransmitWorker =
+    Option<unsafe extern "C" fn(*mut c_void, *mut f32, u32, *const OutputTiming) -> i32>;
+
+/// Exactly one transmit owner is selected before the stream opens.
+#[derive(Clone, Copy)]
+enum TransmitCallback {
+    Untimed(unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32),
+    Timed(unsafe extern "C" fn(*mut c_void, *mut f32, u32, *const OutputTiming) -> i32),
+}
 
 #[repr(C)]
 struct StreamConfig {
@@ -293,6 +305,9 @@ pub struct AdapterDescriptor {
     stream_get_timing: extern "C" fn(*const AudioStream, *mut StreamTiming) -> c_int,
     cm119_mixer_paths_resolve: extern "C" fn(*const c_char, *mut Cm119MixerPaths) -> c_int,
     alsa_device_resolve: extern "C" fn(*const c_char, u32, u32, *mut UsbDeviceSelection) -> c_int,
+    /// Optional ABI-2 tail: select the observational timed transmit contract.
+    stream_create_with_output_timing:
+        extern "C" fn(*const StreamConfig, TimedTransmitWorker, *mut *mut AudioStream) -> c_int,
 }
 
 // The descriptor is immutable function and data pointers that remain valid for
@@ -310,7 +325,7 @@ struct ValidatedStreamConfig {
     output_channels: usize,
     receive_worker: unsafe extern "C" fn(*mut c_void, *const f32, u32) -> i32,
     receive_worker_context: *mut c_void,
-    transmit_worker: unsafe extern "C" fn(*mut c_void, *mut f32, u32) -> i32,
+    transmit_worker: TransmitCallback,
     transmit_worker_context: *mut c_void,
     extra_output_buffer_milliseconds: u32,
     extra_input_buffer_milliseconds: u32,
@@ -318,6 +333,14 @@ struct ValidatedStreamConfig {
 
 impl ValidatedStreamConfig {
     unsafe fn from_ffi(config: *const StreamConfig) -> Result<Self, c_int> {
+        unsafe { Self::from_ffi_with_timing(config, None) }
+    }
+
+    /// Timed construction ignores the ordinary transmit slot, including NULL.
+    unsafe fn from_ffi_with_timing(
+        config: *const StreamConfig,
+        timed_worker: TimedTransmitWorker,
+    ) -> Result<Self, c_int> {
         if config.is_null() {
             return Err(AUDIO_INVALID_ARGUMENT);
         }
@@ -359,7 +382,12 @@ impl ValidatedStreamConfig {
         }
 
         let receive_worker = config.receive_worker.ok_or(AUDIO_INVALID_ARGUMENT)?;
-        let transmit_worker = config.transmit_worker.ok_or(AUDIO_INVALID_ARGUMENT)?;
+        let transmit_worker = match timed_worker {
+            Some(worker) => TransmitCallback::Timed(worker),
+            None => {
+                TransmitCallback::Untimed(config.transmit_worker.ok_or(AUDIO_INVALID_ARGUMENT)?)
+            }
+        };
         Ok(Self {
             sample_rate_hz: config.native_sample_rate_hz,
             maximum_receive_frame_count: config.maximum_receive_frame_count as usize,
@@ -576,6 +604,7 @@ struct CaptureState {
 /// DAC-paced transmit-worker dispatch, canonicalization, and output metering.
 struct PlaybackState {
     config: ValidatedStreamConfig,
+    timing_history: OutputTimingHistory,
     canonical_output: Box<[f32]>,
     output_meter: MeterAccumulator,
     stats: Arc<SharedStats>,
@@ -599,6 +628,7 @@ impl AudioStream {
             })),
             playback: Box::new(UnsafeCell::new(PlaybackState {
                 config,
+                timing_history: OutputTimingHistory::default(),
                 canonical_output: vec![0.0; playback_sample_count].into_boxed_slice(),
                 output_meter: MeterAccumulator::default(),
                 stats: Arc::clone(&stats),
@@ -741,6 +771,7 @@ impl PlaybackState {
         output: *mut f32,
         frame_count: usize,
         flags: PaStreamCallbackFlags,
+        timing: OutputTiming,
     ) -> c_int {
         if output.is_null() {
             self.stats
@@ -772,14 +803,22 @@ impl PlaybackState {
             let samples = frames * pcm::CANONICAL_CHANNELS;
             let canonical_output = &mut self.canonical_output[..samples];
             canonical_output.fill(0.0);
-            if unsafe {
-                (self.config.transmit_worker)(
-                    self.config.transmit_worker_context,
-                    canonical_output.as_mut_ptr(),
-                    frames as u32,
-                )
-            } != 0
-            {
+            let result = unsafe {
+                match self.config.transmit_worker {
+                    TransmitCallback::Untimed(worker) => worker(
+                        self.config.transmit_worker_context,
+                        canonical_output.as_mut_ptr(),
+                        frames as u32,
+                    ),
+                    TransmitCallback::Timed(worker) => worker(
+                        self.config.transmit_worker_context,
+                        canonical_output.as_mut_ptr(),
+                        frames as u32,
+                        &timing.at_frame(offset),
+                    ),
+                }
+            };
+            if result != 0 {
                 self.stats
                     .worker_failure_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -823,7 +862,7 @@ unsafe extern "C" fn playback_callback(
     _input: *const c_void,
     output: *mut c_void,
     frame_count: std::ffi::c_ulong,
-    _time_info: *const ffi::PaStreamCallbackTimeInfo,
+    time_info: *const ffi::PaStreamCallbackTimeInfo,
     status_flags: PaStreamCallbackFlags,
     user_data: *mut c_void,
 ) -> c_int {
@@ -836,8 +875,18 @@ unsafe extern "C" fn playback_callback(
     // Input xrun accounting belongs exclusively to the capture callback.
     let flags = status_flags & !ffi::PA_INPUT_OVERFLOW;
     state.stats.callback_begin(start, period, flags);
-    let result =
-        unsafe { state.process_callback(output.cast::<f32>(), frame_count as usize, flags) };
+    let timing = match state.config.transmit_worker {
+        TransmitCallback::Timed(_) => state.timing_history.observe(
+            unsafe { time_info.as_ref() },
+            flags,
+            start,
+            frame_count as usize,
+        ),
+        TransmitCallback::Untimed(_) => OutputTiming::unknown(start),
+    };
+    let result = unsafe {
+        state.process_callback(output.cast::<f32>(), frame_count as usize, flags, timing)
+    };
     state.stats.callback_end(start, ffi::monotonic_ns());
     result
 }
@@ -1142,6 +1191,15 @@ fn stream_create_with_functions(
         Ok(config) => config,
         Err(error) => return error,
     };
+    stream_create_validated(functions, config, stream)
+}
+
+/// Open the same two endpoints for either admitted transmit contract.
+fn stream_create_validated(
+    functions: &'static ffi::FunctionTable,
+    config: ValidatedStreamConfig,
+    stream: *mut *mut AudioStream,
+) -> c_int {
     if let Err(error) = portaudio_acquire(functions) {
         return error;
     }
@@ -1244,6 +1302,42 @@ extern "C" fn stream_create(config: *const StreamConfig, stream: *mut *mut Audio
     stream_create_with_functions(&ffi::PRODUCTION_FUNCTIONS, config, stream)
 }
 
+/// Validate the timed constructor before acquiring the runtime or any device.
+fn stream_create_with_output_timing_with_functions(
+    functions: &'static ffi::FunctionTable,
+    config: *const StreamConfig,
+    timed_worker: TimedTransmitWorker,
+    stream: *mut *mut AudioStream,
+) -> c_int {
+    if stream.is_null() {
+        return AUDIO_INVALID_ARGUMENT;
+    }
+    unsafe { *stream = ptr::null_mut() };
+    let Some(worker) = timed_worker else {
+        return AUDIO_INVALID_ARGUMENT;
+    };
+    let config = match unsafe { ValidatedStreamConfig::from_ffi_with_timing(config, Some(worker)) }
+    {
+        Ok(config) => config,
+        Err(error) => return error,
+    };
+    stream_create_validated(functions, config, stream)
+}
+
+/// Additive constructor; the original StreamConfig layout is unchanged.
+extern "C" fn stream_create_with_output_timing(
+    config: *const StreamConfig,
+    timed_worker: TimedTransmitWorker,
+    stream: *mut *mut AudioStream,
+) -> c_int {
+    stream_create_with_output_timing_with_functions(
+        &ffi::PRODUCTION_FUNCTIONS,
+        config,
+        timed_worker,
+        stream,
+    )
+}
+
 /// Select the highest available FIFO priority without lowering an inherited
 /// real-time priority. Failure to elevate is a reported limitation, not an
 /// audio-device error.
@@ -1317,6 +1411,8 @@ extern "C" fn stream_start(stream: *mut AudioStream) -> c_int {
     if stream.stop_endpoints() != AUDIO_OK {
         return AUDIO_PORTAUDIO_ERROR;
     }
+    // Successful stop joined playback. Reset only while its owner is quiescent.
+    unsafe { (*stream.playback.get()).timing_history = OutputTimingHistory::default() };
     // PortAudio 19.6 ALSA's RT helper requests FIFO priority 1, not the highest
     // priority. Its default callback thread inherits the starter's scheduling.
     // Elevate only this lifecycle call, then restore the caller on every path.
@@ -3097,6 +3193,7 @@ static DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     stream_get_timing,
     cm119_mixer_paths_resolve,
     alsa_device_resolve,
+    stream_create_with_output_timing,
 };
 
 /// Return the immutable function table for ABI version two.

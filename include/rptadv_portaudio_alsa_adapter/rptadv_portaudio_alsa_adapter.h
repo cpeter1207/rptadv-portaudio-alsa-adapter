@@ -106,6 +106,69 @@ typedef int32_t (*rptadv_audio_transmit_worker)(void *context, float *output,
 					uint32_t frame_count);
 
 /**
+ * @brief Backend presentation observation for exactly one transmit-worker block.
+ *
+ * These are estimates, not proof of physical presentation. The backend times
+ * share one stream clock with an unspecified origin; they are NOT nanoseconds
+ * on CLOCK_MONOTONIC. The monotonic observation is sampled later at callback
+ * entry, not simultaneously with the backend current-time observation. Do not
+ * subtract timestamps from different domains or treat them as clock anchors.
+ *
+ * Missing, nonfinite, late (DAC before current time in the backend domain),
+ * regressing or numerically unusable timestamps, output discontinuity/priming,
+ * and unavailable/regressing local clock observations yield estimate_valid=0.
+ * Accepted current-time, monotonic and last-sample DAC high-water marks survive
+ * faults until a successful quiesced restart. The last-sample estimate covers
+ * the entire accepted host block, independent of splitting or later worker
+ * abort; it is not proof of committed delivery. Zero-frame calls retain history.
+ * Equality at a previous high-water mark is only a nondecreasing observation.
+ * Equal backend current times are permitted within one host-buffer processing
+ * turn. Unknown records clear both backend timestamps, never use static latency.
+ *
+ * For a split host block, the first-frame estimate includes only its absolute
+ * frame offset at 48 kHz. Do not add the reported static output latency again.
+ * The record is borrowed only during its matching timed worker invocation.
+ */
+struct rptadv_audio_output_timing {
+	/** Complete supplied record size; check before reading any optional tail. */
+	uint32_t struct_size;
+	/** Descriptor ABI that supplied this record. */
+	uint32_t abi_version;
+	/** One when a backend estimate is available, zero when unknown. */
+	uint32_t estimate_valid;
+	/** Reserved alignment field, always zero. */
+	uint32_t reserved;
+	/** CLOCK_MONOTONIC callback-entry observation; zero on clock-read failure. */
+	uint64_t callback_monotonic_ns;
+	/** Backend stream-clock callback time in seconds, or zero when unknown. */
+	double stream_current_time_seconds;
+	/** This block's first-frame DAC estimate in backend seconds, or zero. */
+	double first_frame_dac_time_seconds;
+	/**
+	 * Always UINT64_MAX: no finite physical first-DAC error bound is known.
+	 * This also supplies no bound for mapping to CLOCK_MONOTONIC. A finite
+	 * value has no defined interpretation in this contract and must not be
+	 * taken as qualification by a consumer.
+	 */
+	uint64_t maximum_error_ns;
+};
+
+/**
+ * @brief DAC-paced transmit worker with explicitly unbounded backend estimates.
+ * @param context Existing StreamConfig transmit_worker_context, unchanged.
+ * @param output Canonical interleaved stereo output to populate completely.
+ * @param frame_count Number of native time frames in this bounded invocation.
+ * @param timing Borrowed observation for exactly this output block.
+ * @return Zero on success; nonzero aborts playback as for the ordinary worker.
+ *
+ * This replaces the ordinary transmit worker for the timed constructor. It
+ * must not allocate, lock, block, log, or perform I/O. Estimate validity does
+ * not authorize RF, establish output delivery, or qualify a physical age bound.
+ */
+typedef int32_t (*rptadv_audio_timed_transmit_worker)(void *context, float *output,
+	uint32_t frame_count, const struct rptadv_audio_output_timing *timing);
+
+/**
  * @brief Stream setup selected by the control plane before the device opens.
  *
  * The caller resolves a stable device identity before it supplies the resulting
@@ -622,6 +685,22 @@ struct rptadv_audio_adapter_descriptor {
 	enum rptadv_audio_result (*alsa_device_resolve)(const char *native_name,
 		uint32_t input_channels, uint32_t output_channels,
 		struct rptadv_audio_usb_device_selection *selection);
+	/**
+	 * @brief Optional ABI-2 tail selecting observational output timing.
+	 *
+	 * Require the complete descriptor tail before calling. All ordinary
+	 * configuration and lifecycle rules apply, except config->transmit_worker
+	 * is ignored and may be NULL. The non-NULL timed_worker is the sole TX
+	 * owner and receives config->transmit_worker_context. Invalid arguments
+	 * are rejected before device acquisition; a supplied output is cleared.
+	 * Backend estimates are always unbounded, including when estimate_valid
+	 * is one. No clock-domain conversion or physical presentation guarantee
+	 * is supplied. The ordinary stream_create contract is unchanged.
+	 */
+	enum rptadv_audio_result (*stream_create_with_output_timing)(
+		const struct rptadv_audio_stream_config *config,
+		rptadv_audio_timed_transmit_worker timed_worker,
+		struct rptadv_audio_stream **stream);
 };
 
 /**

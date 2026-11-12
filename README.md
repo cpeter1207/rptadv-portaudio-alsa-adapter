@@ -28,10 +28,56 @@ S16 Asterisk and CM119 boundaries.
 
 ## Status
 
-Version `0.2.0-alpha.4` packages separate input-paced receive and DAC-paced
+Unreleased candidate `0.2.0-alpha.5` packages separate input-paced receive and DAC-paced
 transmit workers as a Rust `cdylib` with ABI major 2. Release publication requires
 the full pull-request quality gate, including native Debian 13 amd64 and arm64
 package checks and 100% production line and branch coverage on amd64.
+
+## Output timing observations (unreleased)
+
+The optional ABI-2 descriptor tail stream_create_with_output_timing selects
+one timed transmit worker instead of the ordinary worker. It reuses the existing
+stream configuration, transmit context, buffers and lifecycle. The ordinary
+constructor and all published prefix offsets are unchanged; SONAME and runtime
+package remain 2. Consumers adopting this operation must require the complete
+descriptor tail and the eventual alpha5 runtime/development release. No consumer
+is changed before that independently gated release.
+
+Each worker receives a borrowed, sized observation for its own output span.
+PortAudio's currentTime and outputBufferDacTime share the backend's stream
+clock. Split blocks add their absolute frame offset at the configured 48 kHz,
+without adding static output latency again. The existing callback-entry
+CLOCK_MONOTONIC observation is separate. These observations are not simultaneous
+cross-clock anchors.
+
+PortAudio's ALSA backend obtains a status timestamp and queued-frame delay
+before buffer processing and PCM commit. The buffer processor can add its own
+retained-frame offsets and invoke multiple callbacks without refreshing
+currentTime. Neither API provides a finite error bound for that estimate or
+unknown hardware delay. Consequently maximum_error_ns is always UINT64_MAX,
+even when estimate_valid is one; finite values have no defined meaning in this
+contract. This is an observational prerequisite, not qualified output timing.
+
+Missing/nonfinite/late/regressing values, output discontinuity or priming, and
+unavailable/regressing monotonic observations report unknown. Accepted
+current-time, monotonic and last-sample DAC high-water marks survive such
+failures and reset only after successful quiescence before a restart. The
+last-sample estimate covers the full accepted host block, independently of
+splitting, without claiming committed delivery. Equality means nondecreasing
+observation only; zero-frame callbacks leave history unchanged. The callback adds no allocation, lock, I/O,
+queue, source-clock estimator or second transmit owner.
+
+This contract cannot establish admission-to-DAC age, physical OFF, settling,
+or RF acceptance. A future final-age consumer still needs qualified clock-domain
+and hardware-delay evidence plus source-span and graph/converter/queue accounting.
+No default calibration or finite timing bound is invented here.
+
+Source references: [PortAudio callback times](https://github.com/PortAudio/portaudio/blob/v19.7.0/include/portaudio.h#L692-L703),
+[ALSA timestamp calculation](https://github.com/PortAudio/portaudio/blob/v19.7.0/src/hostapi/alsa/pa_linux_alsa.c#L3409-L3457),
+and [buffer-processing time adjustments](https://github.com/PortAudio/portaudio/blob/v19.7.0/src/common/pa_process.c#L677-L686).
+These references explain the limitation; they do not identify or qualify a
+deployed target's backend version. Ownership remains consistent with
+rpt_advanced ADRs 0022, 0027, 0028 and the phone-patch requirements in ADR 0044.
 
 ## Published artifacts
 
@@ -202,3 +248,9 @@ only thin workflow callers.
 ## License
 
 GPL-2.0-only.  See [COPYING](COPYING).
+
+The same status-delay calculation and repeated-currentTime behavior were
+confirmed in upstream PortAudio pa_stable_v190600_20161030 (commit
+396fe4b6699ae929d3a685b3ef8a7e97396139a4), matching the source release family
+of the Debian 13 test image's PortAudio 19.6.0-1.2+b3. No audio device was opened
+for these checks.
