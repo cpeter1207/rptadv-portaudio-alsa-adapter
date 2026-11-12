@@ -14,6 +14,8 @@ pub(crate) const PA_INTERNAL_ERROR: PaError = -9986;
 pub(crate) const PA_FLOAT_32: PaSampleFormat = 0x0000_0001;
 pub(crate) const PA_INPUT_OVERFLOW: PaStreamCallbackFlags = 0x0000_0002;
 pub(crate) const PA_OUTPUT_UNDERFLOW: PaStreamCallbackFlags = 0x0000_0004;
+pub(crate) const PA_OUTPUT_OVERFLOW: PaStreamCallbackFlags = 0x0000_0008;
+pub(crate) const PA_PRIMING_OUTPUT: PaStreamCallbackFlags = 0x0000_0010;
 pub(crate) const PA_NO_DEVICE: PaDeviceIndex = -1;
 
 /// Linux FIFO policy; its highest supported priority is queried at stream startup.

@@ -109,10 +109,12 @@ fn worker_failures_abort_the_responsible_endpoint() {
     let mut output = [1.0; 2];
     assert_eq!(
         unsafe {
-            stream
-                .playback
-                .get_mut()
-                .process_callback(output.as_mut_ptr(), 2, 0)
+            stream.playback.get_mut().process_callback(
+                output.as_mut_ptr(),
+                2,
+                0,
+                OutputTiming::unknown(0),
+            )
         },
         ffi::PA_ABORT
     );
@@ -133,6 +135,7 @@ fn playback_splits_blocks_and_handles_empty_or_missing_output() {
                 output.as_mut_ptr(),
                 4,
                 ffi::PA_OUTPUT_UNDERFLOW,
+                OutputTiming::unknown(0),
             )
         },
         ffi::PA_CONTINUE
@@ -151,19 +154,23 @@ fn playback_splits_blocks_and_handles_empty_or_missing_output() {
     );
     assert_eq!(
         unsafe {
-            stream
-                .playback
-                .get_mut()
-                .process_callback(ptr::null_mut(), 2, 0)
+            stream.playback.get_mut().process_callback(
+                ptr::null_mut(),
+                2,
+                0,
+                OutputTiming::unknown(0),
+            )
         },
         ffi::PA_ABORT
     );
     assert_eq!(
         unsafe {
-            stream
-                .playback
-                .get_mut()
-                .process_callback(output.as_mut_ptr(), 0, 0)
+            stream.playback.get_mut().process_callback(
+                output.as_mut_ptr(),
+                0,
+                0,
+                OutputTiming::unknown(0),
+            )
         },
         ffi::PA_CONTINUE
     );

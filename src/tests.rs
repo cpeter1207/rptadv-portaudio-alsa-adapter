@@ -15,6 +15,8 @@ use std::path::Path;
 
 #[path = "tests/cm119_release.rs"]
 mod cm119_release;
+#[path = "tests/output_timing.rs"]
+mod output_timing;
 #[path = "tests/release_callbacks.rs"]
 mod release_callbacks;
 
@@ -164,6 +166,7 @@ impl AudioStream {
                 output,
                 frames,
                 flags & ffi::PA_OUTPUT_UNDERFLOW,
+                OutputTiming::unknown(0),
             )
         }
     }
@@ -185,7 +188,7 @@ fn test_config(
         output_channels,
         receive_worker: accept_input,
         receive_worker_context: ptr::null_mut(),
-        transmit_worker,
+        transmit_worker: TransmitCallback::Untimed(transmit_worker),
         transmit_worker_context: ptr::null_mut(),
         extra_output_buffer_milliseconds: 0,
         extra_input_buffer_milliseconds: 0,
