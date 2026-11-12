@@ -1,4 +1,4 @@
-rptadv-portaudio-alsa-adapter (0.2.0~alpha5-1) UNRELEASED; urgency=medium
+rptadv-portaudio-alsa-adapter (0.2.0~alpha5-1) unstable; urgency=medium
 
   * Append an ABI-2 timed transmit constructor with backend callback estimates.
   * Preserve SONAME 2; timing uncertainty remains explicitly unbounded.
